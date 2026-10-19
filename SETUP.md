@@ -90,8 +90,8 @@ python3 scripts/reinstall.py
 
 **Done when** it ends with "Reinstalled; restart MCP clients to pick up tool changes." If it
 still reports Full Disk Access, remove **msgmcp** from the list with "–", add it again,
-and rerun. The check also reads WhatsApp Desktop, so on a Mac without WhatsApp Desktop it
-fails there; tell the user rather than working around it.
+and rerun. The check reads only selected stores. If a selected app is absent, report the
+failure to the user.
 
 When it serves Signal, the script also prints "Checking Signal", before the Full Disk
 Access check, and the first time (in step 2 or here) macOS asks whether msgmcp may use
@@ -108,10 +108,10 @@ service is a LaunchAgent in your login session.
 
 ### 4. Choose whether agents may send
 
-Agents can always read. With `--allow-send`, they can also send iMessages, but only to
-addresses saved in Contacts, and only after the user approves a draft (the agent's rule,
-not the server's; see [Security](README.md#security)). Ask the user, and remember the
-answer for step 7.
+Agents can read the selected stores. With `--allow-send`, they can also send iMessages,
+but only to addresses saved in Contacts, and only after the user approves a draft (the agent's rule,
+not the server's; see [Security](README.md#security)). Sending requires the `imessage`
+source. Ask the user, and remember the answer for step 7.
 
 ### 5. Tailscale on the Mac
 
@@ -223,10 +223,10 @@ secrets:
 
 Put this in the agent's chat or saved instructions:
 
-> You can read my iMessage, SMS, WhatsApp, Signal and Telegram history, and send iMessages once I approve
-> a draft, through msgmcp. At the start of every session, clone
-> https://github.com/akurilin/msgmcp.git and follow `agent/README.md`. If any setup check
-> fails, stop and tell me.
+> You can read the message stores I enabled through msgmcp. If `send_message` is available,
+> send an iMessage only after I approve the exact text and recipient. At the start of each
+> session, clone https://github.com/akurilin/msgmcp.git and follow `agent/README.md`.
+> If any setup check fails, stop and tell me.
 
 The agent then sets itself up from [agent/README.md](agent/README.md) and reads the tool
 list from the server; nothing about the tools needs pasting.

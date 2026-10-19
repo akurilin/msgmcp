@@ -4,14 +4,13 @@ A local MCP server, written in Rust, for message history on a Mac. It reads iMes
 and SMS from `chat.db`, WhatsApp Desktop from its `ChatStorage.sqlite`, Signal Desktop
 from its encrypted `db.sqlite` and Telegram for macOS from its encrypted Postbox cache, all
 read-only, looks people up in Contacts, WhatsApp's address book, Signal conversations and
-Telegram's contacts,
-and sends iMessage text through the Messages app.
+Telegram's contacts, and sends iMessage text through the Messages app.
 
 ## The problem
 
 Agents increasingly run in cloud sandboxes (Claude, Codex, Grok and others), but your
-iMessages, texts, WhatsApp, Signal and Telegram chats and contacts live on your Mac. Apple offers no API for
-them; they sit in local databases that only an app with Full Disk Access can read. So an
+iMessages, texts, WhatsApp, Signal and Telegram chats and contacts live on your Mac.
+msgmcp reads their local data; macOS protects some of it with Full Disk Access. An
 agent that could answer "what did Sarah say about Saturday?" or draft a reply has no way
 to see them.
 
@@ -54,7 +53,7 @@ flowchart LR
   agent -- "tailnet, tag:agent:<br/>HTTPS to the Mac only" --> serve
   serve --> gateway
   local --> app
-  app -- "Full Disk Access, read-only" --> stores
+  app -- "read-only;<br/>Full Disk Access where needed" --> stores
   app -- "Signal's database key,<br/>after Always Allow" --> keychain
   app -- "Automation: send,<br/>Contacts recipients only" --> messages
   app --> audit
@@ -82,10 +81,12 @@ flowchart LR
 [SETUP.md](SETUP.md) is the step-by-step runbook, from a fresh checkout to a cloud agent
 connected, with a check for each step. An agent on the Mac can work through it with you.
 
-In short, `python3 scripts/reinstall.py --sign "<certificate>" --source imessage --source
-whatsapp --source signal` builds the release binary, installs `~/Applications/msgmcp.app`
-and its LaunchAgent, and checks that the service can read the stores. Each `--source`
-enables one store, and nothing else is read: list only the apps you want agents to see
+In short, `python3 scripts/reinstall.py --sign "<certificate>" --source imessage` builds
+the release binary, installs `~/Applications/msgmcp.app` and its LaunchAgent, and checks
+that the service can read the selected stores. The sources are `imessage` (iMessage and
+SMS), `whatsapp`, `signal` and `telegram`. Repeat `--source` for each store you choose;
+the service reads only those message stores and Contacts. List only the apps you want
+agents to see
 (without `--source`, a first install lists the stores it found and stops). The first time,
 grant **msgmcp** Full Disk Access (to read `chat.db` and WhatsApp's and Telegram's group
 containers; Signal doesn't need it) and run it again. When it serves Signal, the script also runs
@@ -207,10 +208,10 @@ every call is in the [audit log](#remote-access).
 
 ## Limits
 
-This is a proof of concept for the current macOS `chat.db`, WhatsApp Desktop and Signal
-Desktop schemas, which can change without notice. Signal Desktop updates often; msgmcp
-reads only columns and JSON fields that Signal's own queries use. Signal can only be read,
-not sent to.
+This is a proof of concept for the current Messages, WhatsApp Desktop, Signal Desktop and
+Telegram for macOS data formats, which can change without notice. Signal Desktop updates
+often; msgmcp reads only columns and JSON fields that Signal's own queries use. Signal
+can only be read, not sent to.
 
 Telegram support reads the native Telegram for macOS app (App Store or direct download),
 not Telegram Desktop, which keeps no history on disk. Its database is a cache of what the

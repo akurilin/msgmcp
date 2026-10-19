@@ -2021,8 +2021,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=pathlib.Path, default=BINARY)
     parser.add_argument('--live', choices=('gateway', 'socket'), nargs='?', const='gateway',
-                        help='Also read this Mac\'s Messages, WhatsApp and Signal databases through '
-                             'the installed service (default: gateway)')
+                        help='Also check this Mac\'s enabled message stores through the installed '
+                             'service (default: gateway)')
     args = parser.parse_args()
     BINARY = args.binary.resolve()
     for example in (ENCRYPT, TEMPKEY):

@@ -1,7 +1,7 @@
 # Instructions for agents in cloud sandboxes
 
-You can read the user's iMessage, SMS, WhatsApp, Signal and Telegram history through msgmcp, a server on
-their Mac. You reach it over their private Tailscale network. Your environment has the
+msgmcp lets you read the user's enabled iMessage/SMS, WhatsApp, Signal and Telegram
+stores on their Mac. You reach it over their private Tailscale network. Your environment has the
 server's address in `MSGMCP_URL` (such as `https://my-mac.tail4f2e1c.ts.net/mcp`) and two
 secrets: `TS_AUTHKEY` (joins the network) and `MSGMCP_TOKEN` (authorizes requests). Never
 print, echo, or log either secret, and don't run shell commands with `set -x`.
@@ -57,9 +57,10 @@ failed and `.result.content[0].text` says why.
 - For recent activity: list_conversations with `active_after`, then read_conversation
   with `order: "newest_first"` and a small `limit`.
 - For what the user hasn't read: list_conversations with `"unread_only": true`. Like the
-  apps' unread views, it skips archived chats and filtered iMessage chats (unknown senders,
-  automated senders, junk); add `"include_archived": true` or `"include_filtered": true`
-  to include them. Each conversation has `unread_count`; incoming iMessages have `is_read`.
+  apps' unread views, it skips archived chats and filtered iMessage and Telegram chats
+  (unknown senders, automated senders, junk); add `"include_archived": true` or
+  `"include_filtered": true` to include them. Each conversation has `unread_count`;
+  incoming iMessage, Signal and Telegram messages have `is_read`.
 - If a response has `next_cursor`, repeat the same call with `"cursor"` set to it.
 - Times are RFC 3339.
 
