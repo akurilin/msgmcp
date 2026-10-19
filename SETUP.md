@@ -79,6 +79,13 @@ still reports Full Disk Access, remove **msgmcp** from the list with "–", add 
 and rerun. The check also reads WhatsApp Desktop, so on a Mac without WhatsApp Desktop it
 fails there; tell the user rather than working around it.
 
+With Signal Desktop set up, the script also prints "Checking Signal", before the Full Disk
+Access check, and the first time (in step 2 or here) macOS asks whether msgmcp may use
+"Signal Safe Storage" from the Keychain. The user chooses **Always Allow** (macOS may ask
+for their login password). It prints "Signal access succeeded" with counts, and later runs
+don't ask again. If they chose Deny, rerun the script. Without Signal Desktop this is
+skipped.
+
 Apps on this Mac can connect now: see [Connect a client](README.md#apps-on-this-mac).
 
 ## Part 2: Remote access
@@ -204,7 +211,7 @@ secrets:
 Put this in the agent's chat or saved instructions, with the repository it can read
 (`git remote get-url origin` shows this checkout's):
 
-> You can read my iMessage, SMS and WhatsApp history, and send iMessages once I approve
+> You can read my iMessage, SMS, WhatsApp and Signal history, and send iMessages once I approve
 > a draft, through msgmcp. At the start of every session, fetch the `agent/` folder of
 > github.com/jane-doe/msgmcp fresh and follow `agent/README.md`. If any setup check
 > fails, stop and tell me.

@@ -1,5 +1,5 @@
 //! iMessage/SMS backend: `~/Library/Messages/chat.db` (read-only) and Messages automation.
-use crate::common::{APPLE_EPOCH, Contacts, Filter, Listed, Page, open, person};
+use crate::common::{APPLE_EPOCH, Contacts, Filter, Listed, Page, number, open, person};
 use crate::types::{
     Conversation, Message, Person, SendReceipt, SendStatus, Service, Source, TextStatus,
 };
@@ -186,7 +186,7 @@ pub fn conversations(
             .collect();
         items.push(Listed {
             latest: latest.and_then(time),
-            id,
+            id: id.to_string(),
             conversation: Conversation {
                 source: Source::Imessage,
                 conversation_id: format!("{PREFIX}:{id}"),
@@ -222,7 +222,8 @@ pub fn messages(
         (">", "ASC")
     };
     let db = open(path)?;
-    if let Some(id) = filter.conversation {
+    let conversation = filter.conversation.as_deref().map(number).transpose()?;
+    if let Some(id) = conversation {
         ensure_conversation(&db, id)?;
     }
     let sql = format!(
@@ -230,7 +231,7 @@ pub fn messages(
     );
     let mut stmt = db.prepare(&sql)?;
     let mut rows = stmt.query(params![
-        filter.conversation,
+        conversation,
         after,
         before,
         cursor.0,

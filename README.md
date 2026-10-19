@@ -1,14 +1,14 @@
 # msgmcp
 
 A local MCP server, written in Rust, for message history on a Mac. It reads iMessage
-and SMS from `chat.db` and WhatsApp Desktop from its `ChatStorage.sqlite`, both
-read-only, looks people up in Contacts and WhatsApp's address book, and sends iMessage
-text through the Messages app.
+and SMS from `chat.db`, WhatsApp Desktop from its `ChatStorage.sqlite` and Signal Desktop
+from its encrypted `db.sqlite`, all read-only, looks people up in Contacts and WhatsApp's
+address book, and sends iMessage text through the Messages app.
 
 ## The problem
 
 Agents increasingly run in cloud sandboxes (Claude, Codex, Grok and others), but your
-iMessages, texts, WhatsApp chats and contacts live on your Mac. Apple offers no API for
+iMessages, texts, WhatsApp and Signal chats and contacts live on your Mac. Apple offers no API for
 them; they sit in local databases that only an app with Full Disk Access can read. So an
 agent that could answer "what did Sarah say about Saturday?" or draft a reply has no way
 to see them.
@@ -44,7 +44,8 @@ flowchart LR
       gateway["msgmcp gateway<br/>127.0.0.1:8765/mcp, bearer token"]
       socket["or msgmcp socket<br/>Unix socket, this user only"]
     end
-    stores[("chat.db, ChatStorage.sqlite,<br/>Contacts")]
+    stores[("chat.db, ChatStorage.sqlite,<br/>Signal db.sqlite, Contacts")]
+    keychain[("Keychain<br/>Signal Safe Storage")]
     messages["Messages app"]
     audit[/"Audit log<br/>~/Library/Logs/msgmcp"/]
   end
@@ -52,6 +53,7 @@ flowchart LR
   serve --> gateway
   local --> app
   app -- "Full Disk Access, read-only" --> stores
+  app -- "Signal's database key,<br/>after Always Allow" --> keychain
   app -- "Automation: send,<br/>Contacts recipients only" --> messages
   app --> audit
 ```
@@ -80,9 +82,13 @@ connected, with a check for each step. An agent on the Mac can work through it w
 
 In short, `python3 scripts/reinstall.py --sign "<certificate>"` builds the release binary,
 installs `~/Applications/msgmcp.app` and its LaunchAgent, and checks that the service can
-read both stores. The first time, grant **msgmcp** Full Disk Access (to read `chat.db` and
-WhatsApp's group container) and run it again. Automation → Messages (to send) is requested
-on the first send.
+read the stores. The first time, grant **msgmcp** Full Disk Access (to read `chat.db` and
+WhatsApp's group container) and run it again. With Signal Desktop set up, the script also
+runs `msgmcp --check-signal`, and macOS asks once whether msgmcp may use "Signal Safe
+Storage" from the Keychain: choose Always Allow. Signal encrypts its database with a key
+that only that Keychain item unlocks, and the service never shows that dialog itself, so
+until it's allowed Signal is reported as unavailable. Automation → Messages (to send) is
+requested on the first send.
 
 **To reinstall after changes**, run `python3 scripts/reinstall.py` with no arguments. It reuses
 the installed app's certificate and service options, so macOS keeps its grants. Options:
@@ -179,7 +185,10 @@ every call is in the [audit log](#remote-access).
 
 - **What people text you.** It can steer an agent into leaking what it reads, or, with
   `--allow-send`, texting your contacts. Approving drafts is the agent's rule, not the server's.
-- **WhatsApp names.** Senders choose them, so a stranger can show up as "Mom".
+- **WhatsApp and Signal names.** Senders choose their profile names, so a stranger can show
+  up as "Mom".
+- **Signal's encryption at rest.** Once allowed, msgmcp can read Signal's database key, so
+  anything that controls msgmcp can read your Signal history, as with `chat.db`.
 - **Your address book.** `search_contacts` needs a query but returns anyone who matches,
   so an agent can read most of your contacts with a few short queries.
 - **Your accounts.** The agent platform, GitHub and Tailscale can each let someone in.
@@ -187,8 +196,10 @@ every call is in the [audit log](#remote-access).
 
 ## Limits
 
-This is a proof of concept for the current macOS `chat.db` and WhatsApp Desktop schemas,
-which can change without notice.
+This is a proof of concept for the current macOS `chat.db`, WhatsApp Desktop and Signal
+Desktop schemas, which can change without notice. Signal Desktop updates often; msgmcp
+reads only columns and JSON fields that Signal's own queries use. Signal can only be read,
+not sent to.
 
 ## License
 

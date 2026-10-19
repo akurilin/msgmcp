@@ -100,6 +100,13 @@ if __name__ == '__main__':
         raise SystemExit(f'{install_service.APP} is not certificate-signed')
     wait_for_service(command[0])
     smoke.BINARY = install_service.APP / 'Contents/MacOS/msgmcp'
+    if smoke.SIGNAL_DATABASE.exists():
+        # The service never shows Keychain dialogs, so ask here, where the user is. After
+        # Always Allow this prints counts without asking.
+        print('Checking Signal; if macOS asks about "Signal Safe Storage", choose Always Allow.')
+        if subprocess.run([str(smoke.BINARY), '--check-signal']).returncode != 0:
+            raise SystemExit('msgmcp cannot read Signal. Run this again and choose Always Allow, '
+                             'or see SETUP.md, step 3.')
     try:
         smoke.live(command[0])
     except AssertionError as error:

@@ -5,6 +5,7 @@ mod common;
 mod contacts;
 mod gateway;
 mod imessage;
+mod signal;
 mod socket;
 mod types;
 mod whatsapp;
@@ -13,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use client::Endpoint;
 use common::{
     Filter, MAX_CONTEXT, SCAN_LIMIT, e164, is_contact, keep_conversation, limit,
-    load_contact_records, load_contacts, parse_time,
+    load_contact_records, load_contacts, number, parse_time,
 };
 use rmcp::{
     ServerHandler,
@@ -33,11 +34,22 @@ use types::{
     Unavailable,
 };
 
-/// Parse a source-qualified ID such as `imessage:2771` or `whatsapp:45`.
-fn parse_id(id: &str) -> Result<(Source, i64)> {
+/// Parse a source-qualified ID such as `imessage:2771`, `whatsapp:45` or `signal:<uuid>`
+/// into its source and backend-local ID. iMessage and WhatsApp IDs are integers; Signal
+/// conversation IDs are UUIDs and its message IDs integers.
+fn parse_id(id: &str) -> Result<(Source, String)> {
     id.split_once(':')
-        .and_then(|(p, n)| Some((Source::parse(p)?, n.parse().ok()?)))
-        .with_context(|| format!("Invalid ID {id:?}; IDs look like imessage:123 or whatsapp:45"))
+        .and_then(|(p, local)| {
+            let source = Source::parse(p)?;
+            let valid = match source {
+                Source::Signal => !local.is_empty() && !local.contains(char::is_whitespace),
+                _ => local.parse::<i64>().is_ok(),
+            };
+            valid.then(|| (source, local.to_owned()))
+        })
+        .with_context(|| {
+            format!("Invalid ID {id:?}; IDs look like imessage:123, whatsapp:45 or signal:<uuid>")
+        })
 }
 
 /// Parse a pagination cursor `<source>:<backend cursor>`; an empty backend part means "start".
@@ -52,6 +64,7 @@ struct Paths {
     messages: PathBuf,
     contacts: PathBuf,
     whatsapp: PathBuf,
+    signal: PathBuf,
 }
 
 #[derive(Clone)]
@@ -65,11 +78,12 @@ struct Server {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Conversations {
-    /// Case-insensitive substring of a chat name, identifier, participant address, JID, or contact name.
+    /// Case-insensitive substring of a chat name, identifier, participant address, WhatsApp
+    /// JID, Signal ID, or contact name.
     /// Phone numbers match in any format and in part: "(555) 123-4567", "5551234567" and
     /// "555-1234" all find +15551234567.
     query: Option<String>,
-    /// Restrict to one source; omit to list both, merged.
+    /// Restrict to one source; omit to list all, merged.
     source: Option<Source>,
     /// RFC 3339 time, inclusive: only conversations whose newest message is at or after it.
     active_after: Option<String>,
@@ -98,13 +112,14 @@ enum MessageOrder {
 }
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Messages {
-    /// Source-qualified conversation ID, e.g. "imessage:2771" or "whatsapp:45".
+    /// Source-qualified conversation ID, e.g. "imessage:2771", "whatsapp:45" or
+    /// "signal:<uuid>".
     conversation_id: Option<String>,
-    /// Restrict to one source when conversation_id is omitted; omit to search both.
+    /// Restrict to one source when conversation_id is omitted; omit to search all.
     source: Option<Source>,
     /// Case-insensitive literal text. Required for search_messages.
     text: Option<String>,
-    /// Exact address, WhatsApp JID, contact-name substring, or "me". A phone number matches
+    /// Exact address, WhatsApp JID, Signal ID, contact-name substring, or "me". A phone number matches
     /// in any format; one without a country code is taken as North American (+1).
     sender: Option<String>,
     /// RFC 3339 time, inclusive.
@@ -153,7 +168,7 @@ struct SendRequest {
 fn plan(
     source: Option<Source>,
     conversation: Option<&str>,
-) -> Result<(Vec<Source>, Option<i64>, bool)> {
+) -> Result<(Vec<Source>, Option<String>, bool)> {
     match (conversation.map(parse_id).transpose()?, source) {
         (Some((s, _)), Some(requested)) if s != requested => {
             bail!(
@@ -181,19 +196,21 @@ fn start(order: &[Source], cursor: Option<&str>) -> Result<(usize, Option<String
 }
 
 /// list_conversations order: newest activity first, then conversations without messages,
-/// then source and ID. Times are microseconds so every valid date fits in an i64.
-type ListKey = (std::cmp::Reverse<Option<i64>>, Source, i64);
+/// then source and ID. Times are microseconds so every valid date fits in an i64. IDs sort
+/// by length, then text, which orders integer IDs numerically.
+type ListKey = (std::cmp::Reverse<Option<i64>>, Source, usize, String);
 
-fn list_key(latest: Option<chrono::DateTime<chrono::Utc>>, source: Source, id: i64) -> ListKey {
+fn list_key(latest: Option<chrono::DateTime<chrono::Utc>>, source: Source, id: &str) -> ListKey {
     (
         std::cmp::Reverse(latest.map(|t| t.timestamp_micros())),
         source,
-        id,
+        id.len(),
+        id.to_owned(),
     )
 }
 
 /// A list_conversations cursor is the key of the last returned item: `<micros|->:<source>:<id>`.
-fn format_list_cursor((std::cmp::Reverse(time), source, id): &ListKey) -> String {
+fn format_list_cursor((std::cmp::Reverse(time), source, _, id): &ListKey) -> String {
     let time = time.map_or_else(|| "-".to_owned(), |t| t.to_string());
     format!("{time}:{source}:{id}")
 }
@@ -208,11 +225,10 @@ fn parse_list_cursor(cursor: &str) -> Result<ListKey> {
         t => Some(t.parse().context("Invalid cursor")?),
     };
     let source = Source::parse(source).context("Invalid cursor")?;
-    Ok((
-        std::cmp::Reverse(time),
-        source,
-        id.parse().context("Invalid cursor")?,
-    ))
+    if id.is_empty() {
+        bail!("Invalid cursor")
+    }
+    Ok((std::cmp::Reverse(time), source, id.len(), id.to_owned()))
 }
 
 impl Paths {
@@ -221,6 +237,10 @@ impl Paths {
         let path = match source {
             Source::Imessage => self.messages.clone(),
             Source::Whatsapp => self.whatsapp.join("ChatStorage.sqlite"),
+            Source::Signal => {
+                signal::open(&self.signal)?;
+                return Ok(());
+            }
         };
         if !path.exists() {
             bail!("{} not found", path.display())
@@ -329,7 +349,7 @@ impl Server {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        description = "Send an iMessage through the macOS Messages app (WhatsApp sending is not supported). Supply the recipient's phone number or email address, as in list_conversations participants; the recipient must be saved in the user's Contacts; contact names and group chats are not supported. No SMS fallback. Use only when the user asks to send. Returns submitted, not delivery confirmation. Never retry automatically."
+        description = "Send an iMessage through the macOS Messages app (WhatsApp and Signal sending are not supported). Supply the recipient's phone number or email address, as in list_conversations participants; the recipient must be saved in the user's Contacts; contact names and group chats are not supported. No SMS fallback. Use only when the user asks to send. Returns submitted, not delivery confirmation. Never retry automatically."
     )]
     async fn send_message(
         &self,
@@ -363,7 +383,7 @@ impl Server {
     #[tool(
         output_schema = output_schema::<ConversationList>(),
         annotations(read_only_hint = true),
-        description = "List iMessage/SMS and WhatsApp conversations, newest activity first across both sources. Filter by recent activity (active_after), unread messages (unread_only, which skips archived and filtered chats by default), chat name, participant address or JID, or contact name. Each item has an unread_count and a source-qualified conversation_id (imessage:N or whatsapp:N). Follow next_cursor until complete."
+        description = "List iMessage/SMS, WhatsApp and Signal conversations, newest activity first across all sources. Filter by recent activity (active_after), unread messages (unread_only, which skips archived and filtered chats by default), chat name, participant address, WhatsApp JID or Signal ID, or contact name. Each item has an unread_count and a source-qualified conversation_id (imessage:N, whatsapp:N or signal:<uuid>). Follow next_cursor until complete."
     )]
     async fn list_conversations(
         &self,
@@ -403,10 +423,13 @@ impl Server {
                         Source::Whatsapp => {
                             whatsapp::conversations(&paths.whatsapp, &contacts, active_after)?
                         }
+                        Source::Signal => {
+                            signal::conversations(&paths.signal, &contacts, active_after)?
+                        }
                     };
                     for mut item in listed {
-                        let key = list_key(item.latest, source, item.id);
-                        if after.is_none_or(|a| key > a)
+                        let key = list_key(item.latest, source, &item.id);
+                        if after.as_ref().is_none_or(|a| &key > a)
                             && (!unread_only || {
                                 let c = &item.conversation;
                                 c.unread_count > 0
@@ -422,7 +445,7 @@ impl Server {
                 if missing.len() == order.len() {
                     return Err(none_readable(&missing));
                 }
-                items.sort_by_key(|a| a.0);
+                items.sort_by(|a, b| a.0.cmp(&b.0));
                 let more = items.len() > cap;
                 items.truncate(cap);
                 let next = more
@@ -442,7 +465,7 @@ impl Server {
     #[tool(
         output_schema = output_schema::<MessageList>(),
         annotations(read_only_hint = true),
-        description = "Search decoded iMessage/SMS and WhatsApp text using a case-insensitive literal substring. Optional source, conversation, date and sender filters. Without a source or conversation, iMessage results come first, then WhatsApp. Scans at most 10000 rows per call; follow next_cursor until complete."
+        description = "Search decoded iMessage/SMS, WhatsApp and Signal text using a case-insensitive literal substring. Optional source, conversation, date and sender filters. Without a source or conversation, iMessage results come first, then WhatsApp, then Signal. Scans at most 10000 rows per call; follow next_cursor until complete."
     )]
     async fn search_messages(
         &self,
@@ -454,7 +477,7 @@ impl Server {
     #[tool(
         output_schema = output_schema::<MessageList>(),
         annotations(read_only_hint = true),
-        description = "Read one conversation. conversation_id (e.g. imessage:2771 or whatsapp:45) is required. Messages are oldest first; pass order newest_first with limit N to get the latest N. Use next_cursor for more messages; date filters use RFC 3339."
+        description = "Read one conversation. conversation_id (e.g. imessage:2771, whatsapp:45 or signal:<uuid>) is required. Messages are oldest first; pass order newest_first with limit N to get the latest N. Use next_cursor for more messages; date filters use RFC 3339."
     )]
     async fn read_conversation(
         &self,
@@ -535,12 +558,13 @@ impl Server {
                 if source != message_source {
                     bail!("message_id and conversation_id must come from the same source")
                 }
+                let message = number(&message).context("Message not found in conversation")?;
                 let (contacts, readable) = load_contacts(&paths.contacts);
                 let messages = match source {
                     Source::Imessage => imessage::context(
                         &paths.messages,
                         &contacts,
-                        conversation,
+                        number(&conversation)?,
                         message,
                         before,
                         after,
@@ -548,7 +572,15 @@ impl Server {
                     Source::Whatsapp => whatsapp::context(
                         &paths.whatsapp,
                         &contacts,
-                        conversation,
+                        number(&conversation)?,
+                        message,
+                        before,
+                        after,
+                    )?,
+                    Source::Signal => signal::context(
+                        &paths.signal,
+                        &contacts,
+                        &conversation,
                         message,
                         before,
                         after,
@@ -630,6 +662,14 @@ impl Server {
                         left,
                         budget,
                     )?,
+                    Source::Signal => signal::messages(
+                        &paths.signal,
+                        &contacts,
+                        &filter,
+                        cursor.as_deref(),
+                        left,
+                        budget,
+                    )?,
                 };
                 items.extend(page.items);
                 scanned += page.scanned;
@@ -655,7 +695,7 @@ impl Server {
         .await
     }
 }
-const INSTRUCTIONS: &str = "Search and read the user’s iMessage, SMS and WhatsApp history on this Mac. To find messages by person, first call list_conversations with their name; for unread conversations, call list_conversations with unread_only; for recent activity, call list_conversations with active_after, then read_conversation with order newest_first and a small limit; a person can have both an imessage: and a whatsapp: conversation. IDs are source-qualified strings such as imessage:2771 or whatsapp:45.";
+const INSTRUCTIONS: &str = "Search and read the user’s iMessage, SMS, WhatsApp and Signal history on this Mac. To find messages by person, first call list_conversations with their name; for unread conversations, call list_conversations with unread_only; for recent activity, call list_conversations with active_after, then read_conversation with order newest_first and a small limit; a person can have an imessage:, a whatsapp: and a signal: conversation. IDs are source-qualified strings such as imessage:2771, whatsapp:45 or signal:<uuid>.";
 const SEND_INSTRUCTIONS: &str = " Send messages (iMessage only) only when the user asks. Sending returns submission, not delivery confirmation; never retry automatically.";
 const COMMON_INSTRUCTIONS: &str = " Follow continuation cursors with the same filters. Times use RFC 3339. Phone numbers are E.164 in results and match in any format in arguments. Contact names are optional. To look up a person's numbers and addresses, call search_contacts.";
 
@@ -684,7 +724,7 @@ msgmcp gateway [--listen ADDRESS] [--allow-host HOST]... [--allow-send] [--token
     MCP over Streamable HTTP at /mcp, with a bearer token; default address 127.0.0.1:8765.
     send_message is offered only with --allow-send. --allow-host accepts another Host
     name, such as a tailnet name. The token file is created on first start.
-STORES: [--database PATH] [--contacts DIRECTORY] [--whatsapp DIRECTORY]
+STORES: [--database PATH] [--contacts DIRECTORY] [--whatsapp DIRECTORY] [--signal DIRECTORY]
 Both services append every tool call and rejected request to the audit log, by default
 ~/Library/Logs/msgmcp/audit.log. send_message only sends to addresses saved in Contacts.
 
@@ -695,7 +735,11 @@ msgmcp call TOOL [JSON] [ENDPOINT]    call one tool; prints its JSON result, or 
 Without an ENDPOINT, clients use the socket if it exists, else the gateway at
 http://127.0.0.1:8765/mcp. The gateway token comes from MSGMCP_TOKEN, else the token file.
 
-msgmcp --check-automation             check Automation access to Messages (read-only)";
+msgmcp --check-automation             check Automation access to Messages (read-only)
+msgmcp --check-signal [--signal DIRECTORY]
+                                      read Signal's database key from the Keychain, asking the
+                                      first time (choose Always Allow), and print counts only.
+                                      The services never ask, so run this once from the app.";
 
 enum Mode {
     Adapter,
@@ -703,6 +747,7 @@ enum Mode {
     Call(String, Option<String>),
     Socket,
     Gateway,
+    CheckSignal,
 }
 
 impl Mode {
@@ -736,6 +781,7 @@ async fn main() -> Result<()> {
         messages: home.join("Library/Messages/chat.db"),
         contacts: home.join("Library/Application Support/AddressBook"),
         whatsapp: home.join("Library/Group Containers/group.net.whatsapp.WhatsApp.shared"),
+        signal: home.join("Library/Application Support/Signal"),
     };
     let default_socket = state.join("run/service.sock");
     let mut audit_log = home.join("Library/Logs/msgmcp/audit.log");
@@ -759,12 +805,14 @@ async fn main() -> Result<()> {
                 mode = Mode::Call(tool, args.next_if(|a| !a.starts_with("--")));
             }
             "--check-automation" => return check_automation(),
+            "--check-signal" if matches!(mode, Mode::Adapter) => mode = Mode::CheckSignal,
             "--socket" => socket = Some(PathBuf::from(value()?)),
             "--url" => url = Some(value()?),
             "--token-file" => token_file = PathBuf::from(value()?),
             "--database" => paths.messages = PathBuf::from(value()?),
             "--contacts" => paths.contacts = PathBuf::from(value()?),
             "--whatsapp" => paths.whatsapp = PathBuf::from(value()?),
+            "--signal" => paths.signal = PathBuf::from(value()?),
             "--audit-log" => audit_log = PathBuf::from(value()?),
             "--listen" => listen = value()?,
             "--allow-host" => allowed_hosts.push(value()?),
@@ -776,7 +824,9 @@ async fn main() -> Result<()> {
             _ => bail!("Unexpected argument: {arg}\n{USAGE}"),
         }
         match arg.as_str() {
-            "--database" | "--contacts" | "--whatsapp" | "--audit-log" => store_option = Some(arg),
+            "--database" | "--contacts" | "--whatsapp" | "--signal" | "--audit-log" => {
+                store_option = Some(arg)
+            }
             "--listen" | "--allow-host" | "--allow-send" => gateway_option = Some(arg),
             _ => {}
         }
@@ -794,12 +844,19 @@ async fn main() -> Result<()> {
         bail!("--socket is for the socket service and clients");
     }
     match mode {
+        Mode::CheckSignal => {
+            let (conversations, messages) = signal::counts(&paths.signal)?;
+            println!("Signal access succeeded; {conversations} conversations, {messages} messages");
+            Ok(())
+        }
         Mode::Socket => {
+            let _prompts = signal::disable_keychain_prompts()?;
             audit::init(audit_log, "socket")?;
             let socket = socket.unwrap_or(default_socket);
             socket::serve(Server::new(paths, true), socket).await
         }
         Mode::Gateway => {
+            let _prompts = signal::disable_keychain_prompts()?;
             audit::init(audit_log, "gateway")?;
             let options = gateway::Options {
                 listen,

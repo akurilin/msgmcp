@@ -7,6 +7,7 @@ import argparse
 import datetime
 import json
 import os
+import shutil
 import pathlib
 import select
 import socket
@@ -20,8 +21,12 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BINARY = ROOT / 'target/debug/msgmcp'
+# Built by this script: Python's sqlite3 can't write SQLCipher databases.
+ENCRYPT = ROOT / 'target/debug/examples/sqlcipher_encrypt'
 TIMEOUT_SECONDS = 10
 SOCKET = pathlib.Path.home() / 'Library/Application Support/MSGMCP/run/service.sock'
+# The live check reads Signal only where Signal Desktop is set up.
+SIGNAL_DATABASE = pathlib.Path.home() / 'Library/Application Support/Signal/sql/db.sqlite'
 GATEWAY_URL = 'http://127.0.0.1:8765/mcp'
 SCAN_LIMIT = 10_000
 APPLE_EPOCH = 978_307_200
@@ -35,6 +40,20 @@ MARCO = {'address': '+393331234567', 'jid': '393331234567@s.whatsapp.net',
          'name': 'Marco Rossi', 'ambiguous': False}
 PRIYA = {'address': '+447700900123', 'jid': '222@lid', 'name': 'Priya', 'ambiguous': False}
 ME = {'address': None, 'name': 'me', 'ambiguous': False}
+# Signal Desktop: times are Unix milliseconds; this is 2023, before the other fixtures.
+SIG = 1_700_000_000_000
+SIGNAL_KEY = '0123456789abcdef' * 4
+SIGNAL_ME = 'a0000000-0000-4000-8000-000000000000'
+SIGNAL_MARCO_ACI, SIGNAL_NICK_ACI, SIGNAL_UNKNOWN_ACI = (
+    f'{c * 8}-0000-4000-8000-000000000000' for c in 'bcd')
+SIGNAL_SELF, SIGNAL_MARCO, SIGNAL_NICK, SIGNAL_GROUP, SIGNAL_REMOVED, SIGNAL_STRANGER = (
+    f'{c * 8}-1111-4111-8111-111111111111' for c in '012345')
+SIGNAL_MARCO_PERSON = {'address': '+393331234567', 'signal_id': SIGNAL_MARCO_ACI,
+                       'name': 'Marco Rossi', 'ambiguous': False}
+SIGNAL_NICK_PERSON = {'address': None, 'signal_id': SIGNAL_NICK_ACI, 'name': 'Nick Name',
+                      'ambiguous': False}
+SIGNAL_UNKNOWN_PERSON = {'address': None, 'signal_id': SIGNAL_UNKNOWN_ACI, 'name': None,
+                         'ambiguous': False}
 
 
 def timestamp(date):
@@ -119,6 +138,90 @@ def whatsapp_fixture(directory):
             INSERT INTO ZWAZACCOUNT VALUES ('222@lid', '447700900123');
         ''')
     lid.close()
+
+
+SIGNAL_SCHEMA = '''
+    CREATE TABLE conversations(id STRING PRIMARY KEY ASC, json TEXT, active_at INTEGER, type STRING, members TEXT, name TEXT, profileName TEXT, profileFamilyName TEXT, profileFullName TEXT, e164 TEXT, serviceId TEXT, groupId TEXT);
+    CREATE TABLE messages(rowid INTEGER PRIMARY KEY ASC, id STRING UNIQUE, json TEXT, readStatus INTEGER, sent_at INTEGER, conversationId STRING, received_at INTEGER, type STRING, body TEXT, sourceServiceId TEXT);
+    CREATE TABLE items(id STRING PRIMARY KEY ASC, json TEXT);
+'''
+
+
+def signal_data(db):
+    """Conversations and messages shaped like Signal Desktop's."""
+    db.execute("INSERT INTO items VALUES('uuid_id', ?)",
+               (json.dumps({'id': 'uuid_id', 'value': f'{SIGNAL_ME}.1'}),))
+    group_members = [{'aci': aci, 'role': 2} for aci in
+                     (SIGNAL_ME, SIGNAL_MARCO_ACI, SIGNAL_NICK_ACI, SIGNAL_UNKNOWN_ACI)]
+    db.executemany('INSERT INTO conversations(id,json,active_at,type,name,profileFullName,e164,serviceId,groupId) VALUES(?,?,?,?,?,?,?,?,?)', [
+        # Note to Self: the user's own account, never used here.
+        (SIGNAL_SELF, '{}', None, 'private', None, 'Alex', '+15550000000', SIGNAL_ME, None),
+        (SIGNAL_MARCO, json.dumps({'unreadCount': 1}), SIG, 'private', 'Marco Phone', 'Marco P',
+         '+393331234567', SIGNAL_MARCO_ACI, None),
+        # A hidden number, a nickname the user set, archived and marked unread.
+        (SIGNAL_NICK, json.dumps({'nicknameGivenName': 'Nick', 'nicknameFamilyName': 'Name',
+                                  'markedUnread': True, 'isArchived': True, 'unreadCount': 0}),
+         SIG, 'private', None, 'Hidden Person', None, SIGNAL_NICK_ACI.upper(), None),
+        (SIGNAL_GROUP, json.dumps({'membersV2': group_members}), SIG, 'group', 'Climbing', None,
+         None, None, 'Z3JvdXA='),
+        (SIGNAL_REMOVED, json.dumps({'removalStage': 'justNotification'}), SIG, 'private', None,
+         'Removed', '+15559990000', 'e' * 8 + '-0000-4000-8000-000000000000', None),
+        # Signal keeps a conversation for every account it has heard of.
+        (SIGNAL_STRANGER, '{}', None, 'private', None, 'Stranger', None,
+         'f' * 8 + '-0000-4000-8000-000000000000', None)])
+    reactions = [{'emoji': '❤️', 'fromId': SIGNAL_MARCO, 'timestamp': SIG + 600},
+                 {'emoji': '👍', 'fromId': SIGNAL_SELF, 'timestamp': SIG + 500}]
+    db.executemany('INSERT INTO messages(rowid,id,json,readStatus,sent_at,conversationId,type,body,sourceServiceId) VALUES(?,?,?,?,?,?,?,?,?)', [
+        (1, 'sig-1', json.dumps({'reactions': reactions}), 0, SIG, SIGNAL_MARCO, 'incoming',
+         'Pizza on Friday?', SIGNAL_MARCO_ACI),
+        (2, 'sig-2', json.dumps({'quote': {'id': SIG, 'authorAci': SIGNAL_MARCO_ACI}}), None,
+         SIG + 1000, SIGNAL_MARCO, 'outgoing', 'Pizza works', None),
+        (3, 'sig-3', '{}', None, SIG + 1500, SIGNAL_MARCO, 'keychange', None, None),
+        (4, 'sig-4', json.dumps({'attachments': [{'contentType': 'image/jpeg'}]}), 1,
+         SIG + 2000, SIGNAL_MARCO, 'incoming', None, SIGNAL_MARCO_ACI),
+        (5, 'sig-5', json.dumps({'deletedForEveryone': True}), 0, SIG + 3000, SIGNAL_MARCO,
+         'incoming', 'secret original text', SIGNAL_MARCO_ACI),
+        (6, 'sig-6', json.dumps({'attachments': [{'contentType': 'application/pdf',
+                                                  'fileName': 'menu.pdf'}]}), 0,
+         SIG + 4000, SIGNAL_MARCO, 'incoming', None, SIGNAL_MARCO_ACI),
+        (7, 'sig-7', '{}', 0, SIG + 5000, SIGNAL_GROUP, 'incoming', 'Crag at nine',
+         SIGNAL_NICK_ACI.upper()),
+        (8, 'sig-8', '{}', None, SIG + 6000, SIGNAL_GROUP, 'group-v2-change', None, None),
+        (9, 'sig-9', '{}', 0, SIG + 7000, SIGNAL_GROUP, 'incoming', 'Who has the rope?',
+         SIGNAL_UNKNOWN_ACI),
+        # From before Signal used account IDs: only the phone number.
+        (10, 'sig-10', json.dumps({'source': '+15551234567'}), 0, SIG + 8000, SIGNAL_GROUP,
+         'incoming', 'Old pizza message', None),
+        (11, 'sig-11', '{}', None, SIG + 9000, SIGNAL_MARCO, 'story', 'Story pizza', None),
+        (12, 'sig-12', '{}', 0, SIG + 10000, SIGNAL_REMOVED, 'incoming', 'Removed pizza',
+         'e' * 8 + '-0000-4000-8000-000000000000'),
+        (13, 'sig-13', '{}', None, SIG + 11000, SIGNAL_NICK, 'outgoing', 'See you at the crag',
+         None)])
+
+
+_encrypted_signal = {}
+
+
+def signal_fixture(directory, data=True, key=SIGNAL_KEY):
+    """A Signal Desktop folder: config.json with a plaintext key, as installs from before
+    2024 have, and sql/db.sqlite encrypted with SQLCipher."""
+    if data not in _encrypted_signal:
+        work = pathlib.Path(tempfile.mkdtemp())
+        try:
+            with sqlite3.connect(work / 'plain.db') as db:
+                db.executescript(SIGNAL_SCHEMA)
+                if data:
+                    signal_data(db)
+            db.close()
+            subprocess.run([str(ENCRYPT), work / 'plain.db', work / 'db.sqlite', SIGNAL_KEY],
+                           check=True)
+            _encrypted_signal[data] = (work / 'db.sqlite').read_bytes()
+        finally:
+            shutil.rmtree(work)
+    (directory / 'sql').mkdir(parents=True)
+    (directory / 'sql' / 'db.sqlite').write_bytes(_encrypted_signal[data])
+    (directory / 'config.json').write_text(json.dumps({'key': key}))
+    return directory
 
 
 TYPE_CHECKS = {
@@ -271,6 +374,10 @@ def wa(message, chat):
     return (f'whatsapp:{message}', f'whatsapp:{chat}')
 
 
+def sg(message, chat):
+    return (f'signal:{message}', f'signal:{chat}')
+
+
 class EndToEnd(unittest.TestCase):
     """Runs against the socket service; GatewayEndToEnd repeats it against the gateway."""
     TRANSPORT = 'socket'
@@ -321,12 +428,17 @@ class EndToEnd(unittest.TestCase):
         cn.close()
         self.whatsapp = self.root / 'whatsapp'
         whatsapp_fixture(self.whatsapp)
+        # Readable but empty, so the other tests see only iMessage and WhatsApp; the Signal
+        # tests start a client on signal_fixture's data. Tests must never fall back to the
+        # real Signal folder.
+        self.signal = signal_fixture(self.root / 'signal', data=False)
         self.client = self.start_client(self.root / 'contacts')
 
-    def stores(self, contacts, whatsapp=None):
+    def stores(self, contacts, whatsapp=None, signal=None):
         self.audit_log = self.root / 'logs' / 'audit.log'
         return ['--database', str(self.path), '--contacts', str(contacts),
-                '--whatsapp', str(whatsapp or self.whatsapp), '--audit-log', str(self.audit_log)]
+                '--whatsapp', str(whatsapp or self.whatsapp),
+                '--signal', str(signal or self.signal), '--audit-log', str(self.audit_log)]
 
     def audit(self):
         return [json.loads(line) for line in self.audit_log.read_text().splitlines()]
@@ -348,11 +460,11 @@ class EndToEnd(unittest.TestCase):
                 self.fail('Service startup failed: ' + read())
             time.sleep(0.01)
 
-    def start_client(self, contacts, whatsapp=None):
+    def start_client(self, contacts, whatsapp=None, signal=None):
         run = self.root / ('run-' + str(len(list(self.root.glob('run-*')))))
         socket = run / 'service.sock'
         process, read = self.start_service('socket', '--socket', socket,
-                                           *self.stores(contacts, whatsapp))
+                                           *self.stores(contacts, whatsapp, signal))
         def stop():
             process.terminate()
             process.wait(timeout=TIMEOUT_SECONDS)
@@ -416,6 +528,164 @@ class EndToEnd(unittest.TestCase):
         context = self.client.tool('get_message_context', conversation_id='whatsapp:1',
                                    message_id='whatsapp:2', before=1, after=10)
         self.assertEqual(self.ids(context['messages']), self.ids(messages))
+
+    def signal_client(self):
+        return self.start_client(self.root / 'contacts',
+                                 signal=signal_fixture(self.root / 'signal-data'))
+
+    def test_signal_conversations_and_identities(self):
+        client = self.signal_client()
+        chats = client.pages('list_conversations', 'conversations', source='signal', limit=1)
+        # Removed conversations, and ones never used (Note to Self, a stranger), are left out.
+        self.assertEqual([(c['conversation_id'], c['chat_type'], c['name'], c['identifier'])
+                          for c in chats], [
+            (f'signal:{SIGNAL_NICK}', 'direct', 'Nick Name', SIGNAL_NICK_ACI),
+            (f'signal:{SIGNAL_GROUP}', 'group', 'Climbing', 'Z3JvdXA='),
+            (f'signal:{SIGNAL_MARCO}', 'direct', 'Marco Phone', '+393331234567')])
+        nick, group, marco = chats
+        self.assertEqual(nick['participants'], [SIGNAL_NICK_PERSON])
+        # Groups list current members other than the user.
+        self.assertEqual(group['participants'],
+                         [SIGNAL_MARCO_PERSON, SIGNAL_NICK_PERSON, SIGNAL_UNKNOWN_PERSON])
+        self.assertEqual(marco['participants'], [SIGNAL_MARCO_PERSON])
+        self.assertEqual([c['latest_message_at'] for c in chats], [
+            datetime.datetime.fromtimestamp(t / 1000, datetime.timezone.utc).isoformat()
+            for t in (SIG + 11000, SIG + 8000, SIG + 4000)])
+        self.assertEqual([(c['unread_count'], c.get('marked_unread', False),
+                           c.get('archived', False)) for c in chats],
+                         [(1, True, True), (0, False, False), (1, False, False)])
+        for query, expected in [('nick', [SIGNAL_NICK, SIGNAL_GROUP]),
+                                (SIGNAL_UNKNOWN_ACI[:8], [SIGNAL_GROUP]),
+                                ('333 123', [SIGNAL_GROUP, SIGNAL_MARCO]),
+                                ('marco rossi', [SIGNAL_GROUP, SIGNAL_MARCO])]:
+            with self.subTest(query=query):
+                found = client.tool('list_conversations', source='signal', query=query)
+                self.assertEqual([c['conversation_id'] for c in found['conversations']],
+                                 [f'signal:{c}' for c in expected])
+        unread = client.tool('list_conversations', source='signal', unread_only=True)
+        self.assertEqual([c['conversation_id'] for c in unread['conversations']],
+                         [f'signal:{SIGNAL_MARCO}'])
+        # Signal's 2023 messages sort after the other sources' 2026 ones, and before
+        # whatsapp:2, which has no messages.
+        merged = client.pages('list_conversations', 'conversations', limit=2)
+        self.assertEqual([c['conversation_id'] for c in merged][-4:],
+                         [c['conversation_id'] for c in chats] + ['whatsapp:2'])
+        self.assertNotIn('unavailable_sources', client.tool('list_conversations'))
+
+    def test_signal_read_kinds_replies_reactions_and_context(self):
+        client = self.signal_client()
+        messages = client.pages('read_conversation', 'messages',
+                                conversation_id=f'signal:{SIGNAL_MARCO}', limit=2)
+        # The safety-number change and the story are not messages.
+        self.assertEqual(self.ids(messages), [sg(i, SIGNAL_MARCO) for i in (1, 2, 4, 5, 6)])
+        self.assertEqual([(m['kind'], m['text'], m['text_status']) for m in messages], [
+            ('text', 'Pizza on Friday?', 'ok'), ('text', 'Pizza works', 'ok'),
+            ('image', None, 'no_text'), ('deleted', None, 'no_text'),
+            ('document', 'menu.pdf', 'ok')])
+        self.assertEqual([m['guid'] for m in messages], ['sig-1', 'sig-2', 'sig-4', 'sig-5', 'sig-6'])
+        self.assertEqual([m.get('is_read') for m in messages], [True, None, False, True, True])
+        self.assertEqual(messages[0]['sender'], SIGNAL_MARCO_PERSON)
+        self.assertEqual(messages[1]['sender'], ME)
+        self.assertTrue(messages[1]['is_from_me'])
+        self.assertEqual(messages[1]['reply_to_guid'], 'sig-1')
+        self.assertEqual(messages[0]['reactions'], [
+            {'emoji': '👍', 'is_from_me': True, 'sender': ME},
+            {'emoji': '❤️', 'is_from_me': False, 'sender': SIGNAL_MARCO_PERSON}])
+        self.assertTrue(all('reactions' not in m for m in messages[1:]))
+        self.assertEqual(messages[0]['sent_at'], datetime.datetime.fromtimestamp(
+            SIG / 1000, datetime.timezone.utc).isoformat())
+        latest = client.tool('read_conversation', conversation_id=f'signal:{SIGNAL_MARCO}',
+                             order='newest_first', limit=2)
+        self.assertEqual(self.ids(latest['messages']), [sg(6, SIGNAL_MARCO), sg(5, SIGNAL_MARCO)])
+        group = client.tool('read_conversation', conversation_id=f'signal:{SIGNAL_GROUP}')['messages']
+        self.assertEqual([m['sender'] for m in group], [
+            SIGNAL_NICK_PERSON, SIGNAL_UNKNOWN_PERSON,
+            {'address': '+15551234567', 'name': None, 'ambiguous': False}])
+        context = client.tool('get_message_context', conversation_id=f'signal:{SIGNAL_MARCO}',
+                              message_id='signal:4', before=1, after=1)
+        self.assertEqual(self.ids(context['messages']), [sg(i, SIGNAL_MARCO) for i in (2, 4, 5)])
+
+    def test_signal_search_and_senders(self):
+        client = self.signal_client()
+        pizza = client.tool('search_messages', text='PIZZA', source='signal')['messages']
+        # Not the story, the deleted message's original text, or the removed conversation.
+        self.assertEqual(self.ids(pizza), [sg(1, SIGNAL_MARCO), sg(2, SIGNAL_MARCO),
+                                           sg(10, SIGNAL_GROUP)])
+        everything = client.tool('search_messages', text='pizza')['messages']
+        self.assertEqual(self.ids(everything)[-3:], self.ids(pizza))
+        self.assertTrue(all(m['source'] != 'signal' for m in everything[:-3]))
+        for sender, expected in [('Marco', [1]), ('+39 333 123 4567', [1]), ('me', [2]),
+                                 ('(555) 123-4567', [10])]:
+            with self.subTest(sender=sender):
+                found = client.tool('search_messages', text='pizza', source='signal', sender=sender)
+                self.assertEqual([m['message_id'] for m in found['messages']],
+                                 [f'signal:{i}' for i in expected])
+        for sender in (SIGNAL_UNKNOWN_ACI, SIGNAL_UNKNOWN_ACI.upper()):
+            found = client.tool('read_conversation', conversation_id=f'signal:{SIGNAL_GROUP}',
+                                sender=sender)
+            self.assertEqual([m['message_id'] for m in found['messages']], ['signal:9'])
+        later = client.tool('search_messages', text='pizza', source='signal',
+                            after=datetime.datetime.fromtimestamp(
+                                (SIG + 1000) / 1000, datetime.timezone.utc).isoformat())
+        self.assertEqual([m['message_id'] for m in later['messages']], ['signal:2', 'signal:10'])
+
+    def test_signal_errors(self):
+        client = self.signal_client()
+        cases = [
+            ('read_conversation', {'conversation_id': 'signal:nope'}, 'Unknown conversation ID'),
+            ('read_conversation', {'conversation_id': f'signal:{SIGNAL_REMOVED}'}, 'Unknown conversation ID'),
+            ('read_conversation', {'conversation_id': 'signal:'}, 'Invalid ID'),
+            ('read_conversation', {'conversation_id': 'signal:a b'}, 'Invalid ID'),
+            ('read_conversation', {'conversation_id': f'signal:{SIGNAL_MARCO}', 'cursor': 'signal:x:1'}, 'Invalid cursor'),
+            ('get_message_context', {'conversation_id': f'signal:{SIGNAL_MARCO}', 'message_id': 'signal:3'}, 'Message not found'),
+            ('get_message_context', {'conversation_id': f'signal:{SIGNAL_GROUP}', 'message_id': 'signal:1'}, 'Message not found'),
+            ('get_message_context', {'conversation_id': f'signal:{SIGNAL_MARCO}', 'message_id': 'signal:abc'}, 'Message not found'),
+            ('read_conversation', {'conversation_id': 'imessage:abc'}, 'Invalid ID')]
+        for name, arguments, expected in cases:
+            with self.subTest(tool=name, arguments=arguments):
+                result = client.request('tools/call', {'name': name, 'arguments': arguments})
+                self.assertTrue(result['isError'])
+                self.assertIn(expected, result['content'][0]['text'])
+
+    def test_unreadable_signal_store_is_reported(self):
+        wrong_key = signal_fixture(self.root / 'signal-wrong-key', key='f' * 64)
+        for signal, error in [(self.root / 'no-signal', 'Signal database not found'),
+                              (wrong_key, 'did not open its database')]:
+            with self.subTest(error=error):
+                client = self.start_client(self.root / 'contacts', signal=signal)
+                chats = client.tool('list_conversations')
+                self.assertEqual(len(chats['conversations']), 5)
+                self.assertEqual([u['source'] for u in chats['unavailable_sources']], ['signal'])
+                self.assertIn(error, chats['unavailable_sources'][0]['error'])
+                found = client.tool('search_messages', text='pizza')
+                self.assertEqual([u['source'] for u in found['unavailable_sources']], ['signal'])
+                result = client.request('tools/call', {'name': 'list_conversations',
+                                                       'arguments': {'source': 'signal'}})
+                self.assertTrue(result['isError'])
+                self.assertIn(error, result['content'][0]['text'])
+
+    def test_check_signal_prints_counts_only(self):
+        store = signal_fixture(self.root / 'signal-data')
+        checked = subprocess.run([str(BINARY), '--check-signal', '--signal', str(store)],
+                                 capture_output=True, text=True, timeout=TIMEOUT_SECONDS)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(checked.stdout, 'Signal access succeeded; 3 conversations, 9 messages\n')
+        missing = subprocess.run([str(BINARY), '--check-signal', '--signal', str(self.root / 'none')],
+                                 capture_output=True, text=True, timeout=TIMEOUT_SECONDS)
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn('Signal database not found', missing.stderr)
+
+    def test_signal_store_is_not_modified(self):
+        client = self.signal_client()
+        store = self.root / 'signal-data'
+        before = {p.name: p.read_bytes() for p in store.rglob('*') if p.is_file()}
+        client.tool('list_conversations')
+        client.tool('search_messages', text='pizza')
+        client.tool('read_conversation', conversation_id=f'signal:{SIGNAL_MARCO}')
+        client.tool('get_message_context', conversation_id=f'signal:{SIGNAL_MARCO}',
+                    message_id='signal:2')
+        after = {p.name: p.read_bytes() for p in store.rglob('*') if p.is_file()}
+        self.assertEqual({k: after[k] for k in before}, before)
 
     def test_search_across_sources(self):
         self.db.execute("INSERT INTO message(guid,date,is_from_me,handle_id,text,attributedBody,associated_message_type,thread_originator_guid) VALUES('p',?,0,2,'Pizza place?',NULL,0,NULL)",
@@ -484,7 +754,7 @@ class EndToEnd(unittest.TestCase):
         send = next(t for t in tools if t['name'] == 'send_message')
         self.assertFalse(send['annotations']['readOnlyHint'])
         self.assertFalse(send['annotations']['idempotentHint'])
-        self.assertIn('iMessage, SMS and WhatsApp', self.client.initialized['instructions'])
+        self.assertIn('iMessage, SMS, WhatsApp and Signal', self.client.initialized['instructions'])
         self.assertTrue(all(t['inputSchema']['type'] == 'object' for t in tools))
         self.assertTrue(all(t['outputSchema']['type'] == 'object' for t in tools))
         self.assertEqual(self.client.initialized['serverInfo']['name'], 'msgmcp')
@@ -950,11 +1220,11 @@ class EndToEnd(unittest.TestCase):
 class GatewayEndToEnd(EndToEnd):
     TRANSPORT = 'gateway'
 
-    def start_gateway(self, contacts, whatsapp=None, *options):
+    def start_gateway(self, contacts, whatsapp=None, *options, signal=None):
         self.token_file = self.root / 'gateway' / 'token'
         process, read = self.start_service(
             'gateway', '--listen', '127.0.0.1:0', '--token-file', self.token_file,
-            *options, *self.stores(contacts, whatsapp))
+            *options, *self.stores(contacts, whatsapp, signal))
         def stop():
             process.terminate()
             self.assertEqual(process.wait(timeout=TIMEOUT_SECONDS), 0, read())
@@ -963,9 +1233,9 @@ class GatewayEndToEnd(EndToEnd):
         url = read().split('listening on ', 1)[1].split()[0]
         return process, url
 
-    def start_client(self, contacts, whatsapp=None):
+    def start_client(self, contacts, whatsapp=None, signal=None):
         # The socket suite exercises send_message's schema, so offer it here too.
-        process, self.url = self.start_gateway(contacts, whatsapp, '--allow-send')
+        process, self.url = self.start_gateway(contacts, whatsapp, '--allow-send', signal=signal)
         self.assertEqual(self.token_file.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.token_file.parent.stat().st_mode & 0o777, 0o700)
         self.token = self.token_file.read_text().strip()
@@ -1110,8 +1380,9 @@ class AgentScript(unittest.TestCase):
 def live(service='socket'):
     """Read a little from the installed service; `service` is what the LaunchAgent runs."""
     client = Client(*(['--socket', SOCKET] if service == 'socket' else ['--url', GATEWAY_URL]))
+    sources = ['imessage', 'whatsapp'] + (['signal'] if SIGNAL_DATABASE.exists() else [])
     try:
-        for source in ('imessage', 'whatsapp'):
+        for source in sources:
             chats = client.tool('list_conversations', source=source, limit=2)
             assert chats['conversations'], f'no {source} conversations'
             chat = chats['conversations'][0]['conversation_id']
@@ -1130,10 +1401,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=pathlib.Path, default=BINARY)
     parser.add_argument('--live', choices=('gateway', 'socket'), nargs='?', const='gateway',
-                        help='Also read this Mac\'s Messages and WhatsApp databases through the '
-                             'installed service (default: gateway)')
+                        help='Also read this Mac\'s Messages, WhatsApp and Signal databases through '
+                             'the installed service (default: gateway)')
     args = parser.parse_args()
     BINARY = args.binary.resolve()
+    subprocess.run(['cargo', 'build', '--quiet', '--example', ENCRYPT.name], cwd=ROOT, check=True)
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case)
                                for case in (EndToEnd, GatewayEndToEnd, AgentScript))
     result = unittest.TextTestRunner(verbosity=2).run(suite)

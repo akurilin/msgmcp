@@ -5,15 +5,20 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 
 [dependencies]
+aes = "0.8"
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+cbc = { version = "0.1.2", features = ["alloc"] }
 chrono = "0.4"
 crabstep = { version = "0.7", features = ["foundation"] }
 glob = "0.3"
 libc = "0.2"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rmcp = { version = "3.5", features = ["client", "reqwest", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled-sqlcipher"] }
 schemars = "1"
+security-framework = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "process", "signal", "time"] }

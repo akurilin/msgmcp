@@ -5,7 +5,9 @@
 //!   group members, media items (captions, reply metadata) and receipt info (reactions).
 //! - `LID.sqlite` and `ContactsV2.sqlite`: optional; map opaque `@lid` identities to
 //!   phone numbers and WhatsApp's own contact names.
-use crate::common::{APPLE_EPOCH, Contacts, Filter, Listed, Page, contact_name, e164, open};
+use crate::common::{
+    APPLE_EPOCH, Contacts, Filter, Listed, Page, contact_name, e164, number, open,
+};
 use crate::types::{ChatType, Conversation, Kind, Message, Person, Reaction, Source, TextStatus};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -242,6 +244,7 @@ impl Directory {
         Person {
             address: Some(address),
             jid: Some(jid),
+            signal_id: None,
             name,
             ambiguous,
         }
@@ -403,6 +406,7 @@ fn message(
             None => Person {
                 address: None,
                 jid: None,
+                signal_id: None,
                 name: None,
                 ambiguous: false,
             },
@@ -505,7 +509,7 @@ pub fn conversations(
         };
         items.push(Listed {
             latest: latest.and_then(time),
-            id,
+            id: id.to_string(),
             conversation: Conversation {
                 source: Source::Whatsapp,
                 conversation_id: format!("{PREFIX}:{id}"),
@@ -545,7 +549,8 @@ pub fn messages(
         (">", "ASC")
     };
     let db = chat_storage(dir)?;
-    if let Some(id) = filter.conversation {
+    let conversation = filter.conversation.as_deref().map(number).transpose()?;
+    if let Some(id) = conversation {
         ensure_conversation(&db, id)?;
     }
     let directory = Directory::load(dir, &db);
@@ -554,7 +559,7 @@ pub fn messages(
     );
     let mut stmt = db.prepare(&sql)?;
     let mut rows = stmt.query(params![
-        filter.conversation,
+        conversation,
         apple_seconds(filter.after),
         apple_seconds(filter.before),
         cursor.0,

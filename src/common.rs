@@ -1,4 +1,4 @@
-//! Helpers shared by the iMessage and WhatsApp backends.
+//! Helpers shared by the message store backends.
 use crate::types::{Conversation, Message, Person};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -205,9 +205,15 @@ pub fn person(address: Option<String>, contacts: &Contacts) -> Person {
     Person {
         address: address.as_deref().map(display_address),
         jid: None,
+        signal_id: None,
         name,
         ambiguous,
     }
+}
+
+/// A backend-local ID that the store keeps as an integer.
+pub fn number(id: &str) -> Result<i64> {
+    id.parse().ok().context("Unknown conversation ID")
 }
 
 pub fn limit(value: Option<usize>) -> Result<usize> {
@@ -231,7 +237,7 @@ pub fn parse_time(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
 /// Message filters shared by search_messages and read_conversation.
 pub struct Filter {
     /// Backend-local conversation ID.
-    pub conversation: Option<i64>,
+    pub conversation: Option<String>,
     pub after: Option<DateTime<Utc>>,
     pub before: Option<DateTime<Utc>>,
     /// Lowercased literal substring.
@@ -251,7 +257,7 @@ impl Filter {
             let key = address_key(s);
             let sender = &item.sender;
             !item.is_from_me
-                && ([&sender.address, &sender.jid]
+                && ([&sender.address, &sender.jid, &sender.signal_id]
                     .into_iter()
                     .flatten()
                     .any(|a| a.to_lowercase() == *s || (!key.is_empty() && address_key(a) == key))
@@ -283,7 +289,7 @@ pub struct Listed {
     /// Time of the newest message; `None` for a conversation without messages.
     pub latest: Option<DateTime<Utc>>,
     /// Backend-local conversation ID.
-    pub id: i64,
+    pub id: String,
     pub conversation: Conversation,
 }
 
@@ -298,7 +304,7 @@ pub fn keep_conversation(item: &mut Conversation, query: &str) -> bool {
         || item
             .participants
             .iter()
-            .any(|p| address(&p.address) || hit(&p.name) || hit(&p.jid));
+            .any(|p| address(&p.address) || hit(&p.name) || hit(&p.jid) || hit(&p.signal_id));
     if matched {
         item.participants.truncate(MAX_PARTICIPANTS);
     }

@@ -9,7 +9,7 @@ up msgmcp, give it remote access, or connect a cloud agent, work through
 ## Commands
 
 ```sh
-cargo fmt --check && cargo clippy -- -D warnings && cargo build
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo build && cargo test
 python3 scripts/smoke.py                         # end-to-end, against temporary databases
 python3 scripts/smoke.py --binary target/release/msgmcp
 python3 scripts/smoke.py --live                  # through the installed service; prints no message contents
@@ -40,7 +40,15 @@ Run them before every commit, and add a test for every behavior change.
   are reported through `display_address` (E.164). Agents get numbers in every format, from
   users and from Contacts; the phone-format tests in `smoke.py` pin what must match.
 - **iMessage queries go through `REAL_MESSAGE`** in `imessage.rs`, which drops reactions and
-  events (group changes and the like). WhatsApp has the equivalent `MESSAGE_FILTER`.
+  events (group changes and the like). WhatsApp and Signal have the equivalent
+  `MESSAGE_FILTER`.
+- **Tests pass every store explicitly.** A service started without `--signal` reads the
+  real Signal folder; `stores()` in `smoke.py` passes all of them. Signal's fixture is
+  encrypted by `examples/sqlcipher_encrypt.rs`, which `smoke.py` builds, since Python's
+  sqlite3 can't write SQLCipher.
+- **The services never show Keychain dialogs** (`disable_keychain_prompts`), so a remote
+  call can't hang on one. `msgmcp --check-signal`, run by `reinstall.py`, is where the user
+  allows the app to read "Signal Safe Storage".
 - **Message data is private.** Diagnostics against the user's real databases print counts,
   never message text, names or numbers. `chat.db` needs Full Disk Access, which the app
   has but a development shell usually doesn't; test through the installed service.
@@ -48,11 +56,12 @@ Run them before every commit, and add a test for every behavior change.
 ## Running a service by hand
 
 ```sh
-msgmcp socket --socket /tmp/x/service.sock --database /path/chat.db --contacts /path/AddressBook --whatsapp /path/whatsapp-dir --audit-log /tmp/x/audit.log
+msgmcp socket --socket /tmp/x/service.sock --database /path/chat.db --contacts /path/AddressBook --whatsapp /path/whatsapp-dir --signal /path/signal-dir --audit-log /tmp/x/audit.log
 msgmcp gateway --listen 127.0.0.1:0 --token-file /tmp/x/token --database /path/chat.db ...   # prints its URL
 msgmcp --socket /tmp/x/service.sock                                    # stdio adapter
 msgmcp --url http://127.0.0.1:<port>/mcp --token-file /tmp/x/token      # stdio adapter
 msgmcp --check-automation                                              # read-only AppleScript check
+msgmcp --check-signal                                                  # Keychain grant for Signal; prints counts
 ```
 
 `scripts/send_e2e.py --send` sends one real iMessage to `MSGMCP_TEST_RECIPIENT` in `.env`

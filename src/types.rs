@@ -1,7 +1,7 @@
 //! Typed tool inputs' shared enums and every tool result. Each result type's JSON schema is
 //! published as the tool's `outputSchema`, so the doc comments here are the reference for
 //! result fields; clients see them through `tools/list` or `msgmcp schema`.
-use crate::{imessage, whatsapp};
+use crate::{imessage, signal, whatsapp};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -14,14 +14,16 @@ use std::fmt;
 pub enum Source {
     Imessage,
     Whatsapp,
+    Signal,
 }
-pub const ALL_SOURCES: [Source; 2] = [Source::Imessage, Source::Whatsapp];
+pub const ALL_SOURCES: [Source; 3] = [Source::Imessage, Source::Whatsapp, Source::Signal];
 
 impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Source::Imessage => imessage::PREFIX,
             Source::Whatsapp => whatsapp::PREFIX,
+            Source::Signal => signal::PREFIX,
         })
     }
 }
@@ -36,13 +38,20 @@ impl Source {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Person {
     /// Phone number in E.164 (`+15551234567`), or email address. WhatsApp gives the JID when no
-    /// phone number is known. Null for the user ("me") and for unknown senders.
+    /// phone number is known. Null for the user ("me"), for unknown senders, and for Signal
+    /// accounts whose number is hidden (see `signal_id`).
     pub address: Option<String>,
     /// WhatsApp only: normalized JID, such as `<digits>@s.whatsapp.net` or an opaque `<id>@lid`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jid: Option<String>,
+    /// Signal only: the account's Signal ID (ACI), a lowercase UUID. Signal knows many people
+    /// only by this ID, since phone numbers can be hidden.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal_id: Option<String>,
     /// "me" for the user. Otherwise the AddressBook name; for WhatsApp, then the WhatsApp
-    /// contact name, then the person's WhatsApp profile name. Null when unknown or ambiguous.
+    /// contact name, then the person's WhatsApp profile name; for Signal, then the nickname
+    /// the user gave them in Signal, the name from the user's phone contacts, the person's
+    /// Signal profile name, then their username. Null when unknown or ambiguous.
     pub name: Option<String>,
     /// True when several AddressBook contacts share this address, so no name is given.
     /// Contacts match in any format; a number saved without a country code is taken as
@@ -55,6 +64,7 @@ impl Person {
         Person {
             address: None,
             jid: None,
+            signal_id: None,
             name: Some("me".to_owned()),
             ambiguous: false,
         }
@@ -72,7 +82,7 @@ pub enum TextStatus {
     DecodeFailed,
 }
 
-/// WhatsApp message type.
+/// WhatsApp and Signal message type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -90,7 +100,7 @@ pub enum Kind {
     Other,
 }
 
-/// WhatsApp chat type.
+/// WhatsApp and Signal chat type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatType {
@@ -100,7 +110,7 @@ pub enum ChatType {
     Community,
 }
 
-/// One person's current reaction to a WhatsApp message.
+/// One person's current reaction to a WhatsApp or Signal message.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Reaction {
     pub emoji: String,
@@ -109,70 +119,78 @@ pub struct Reaction {
 }
 
 /// A message. iMessage reactions, events (such as group changes), edit history and recall
-/// state are not returned; WhatsApp group events and security notices are excluded.
+/// state are not returned; WhatsApp group events and security notices are excluded; Signal
+/// events (group changes, safety-number changes, calls, timer changes) and stories are
+/// excluded, and an edited Signal message has its latest text.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Message {
     pub source: Source,
-    /// Source-qualified message ID, e.g. "imessage:85544" or "whatsapp:9120". Pass it back
-    /// exactly as returned.
+    /// Source-qualified message ID, e.g. "imessage:85544", "whatsapp:9120" or "signal:310".
+    /// Pass it back exactly as returned.
     pub message_id: String,
-    /// The store's own message ID (iMessage GUID or WhatsApp stanza ID); other messages'
-    /// `reply_to_guid` refers to it.
+    /// The store's own message ID (iMessage GUID, WhatsApp stanza ID or Signal message UUID);
+    /// other messages' `reply_to_guid` refers to it.
     pub guid: Option<String>,
-    /// Source-qualified conversation ID, e.g. "imessage:2771" or "whatsapp:45".
+    /// Source-qualified conversation ID, e.g. "imessage:2771", "whatsapp:45" or
+    /// "signal:<uuid>".
     pub conversation_id: String,
-    /// RFC 3339 time in UTC.
+    /// RFC 3339 time in UTC. Signal uses the sender's time.
     pub sent_at: Option<String>,
     pub is_from_me: bool,
-    /// iMessage only, present only on incoming messages: whether the user has read it on any
-    /// of their Apple devices.
+    /// iMessage and Signal, present only on incoming messages: whether the user has read it
+    /// (iMessage: on any of their Apple devices; Signal: as Signal Desktop last synced).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_read: Option<bool>,
     pub sender: Person,
-    /// WhatsApp only.
+    /// WhatsApp and Signal only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<Kind>,
     /// Message text. iMessage attachments are not read, so an attachment-only message is the
     /// object replacement character U+FFFC. WhatsApp media text is the caption or file name;
-    /// deleted messages have none.
+    /// Signal media text is the message body, or a document's file name; deleted messages
+    /// have none.
     pub text: Option<String>,
     pub text_status: TextStatus,
     /// `guid` of the message this one replies to. iMessage uses the thread originator, which
-    /// can be the thread root; WhatsApp uses the quoted message.
+    /// can be the thread root; WhatsApp and Signal use the quoted message.
     pub reply_to_guid: Option<String>,
-    /// WhatsApp only, present only when the message has reactions: each person's current
-    /// reaction, oldest first.
+    /// WhatsApp and Signal only, present only when the message has reactions: each person's
+    /// current reaction, oldest first.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<Reaction>,
 }
 
-/// A conversation. WhatsApp status updates and removed chats are excluded.
+/// A conversation. WhatsApp status updates and removed chats are excluded, as are Signal
+/// conversations the user removed or never used (Signal keeps one for every account it has
+/// heard of).
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Conversation {
     pub source: Source,
-    /// Source-qualified conversation ID, e.g. "imessage:2771" or "whatsapp:45". Pass it back
-    /// exactly as returned.
+    /// Source-qualified conversation ID, e.g. "imessage:2771", "whatsapp:45" or
+    /// "signal:<uuid>". Pass it back exactly as returned.
     pub conversation_id: String,
-    /// iMessage chat identifier (phone, email or group ID) or WhatsApp chat JID.
+    /// iMessage chat identifier (phone, email or group ID), WhatsApp chat JID, or for Signal
+    /// the phone number (else Signal ID) of a direct chat or the group ID.
     pub identifier: Option<String>,
     /// Chat display name; empty or null for most direct chats.
     pub name: Option<String>,
-    /// WhatsApp only.
+    /// WhatsApp and Signal only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_type: Option<ChatType>,
-    /// Other participants, at most 50. WhatsApp groups list active members only.
+    /// Other participants, at most 50. WhatsApp and Signal groups list current members only.
     pub participants: Vec<Person>,
     /// Number of participants before the 50-entry cap.
     pub participant_count: usize,
     /// RFC 3339 time in UTC of the newest message, as read_conversation returns them (iMessage
-    /// reactions and events, and WhatsApp system events, don't count). Null when there are no
-    /// messages.
+    /// reactions and events, and WhatsApp and Signal system events, don't count). Null when
+    /// there are no messages.
     pub latest_message_at: Option<String>,
     /// Unread incoming messages; 0 when everything is read. iMessage counts messages not yet
-    /// read on any of the user's Apple devices. WhatsApp uses WhatsApp Desktop's count, which
-    /// can lag behind the phone; a chat the user marked unread counts as 1.
+    /// read on any of the user's Apple devices. WhatsApp and Signal use the desktop app's
+    /// count, which can lag behind the phone; a chat the user marked unread counts as 1.
     pub unread_count: u64,
-    /// WhatsApp only, present only when true: the user marked the chat unread by hand.
+    /// WhatsApp and Signal only, present only when true: the user marked the chat unread by
+    /// hand.
     #[serde(skip_serializing_if = "is_false")]
     pub marked_unread: bool,
     /// Present only when true: the user archived the chat.
@@ -209,7 +227,7 @@ pub struct ConversationList {
     /// Number of AddressBook databases read for contact names; 0 means no names from Contacts.
     pub contacts_databases_read: usize,
     /// Present only when no source was requested and a store could not be read; the other
-    /// store's results are still returned.
+    /// stores' results are still returned.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unavailable_sources: Vec<Unavailable>,
 }
@@ -218,8 +236,8 @@ pub struct ConversationList {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct MessageList {
     /// Sorted by date, then message ID, within each source, in the requested order (oldest
-    /// first by default). iMessage results come before WhatsApp results, so sources are not
-    /// interleaved by date.
+    /// first by default). iMessage results come first, then WhatsApp, then Signal, so sources
+    /// are not interleaved by date.
     pub messages: Vec<Message>,
     /// Pass as `cursor`, with the same filters, for the next page. Null when complete. A page
     /// can be empty and still have a cursor. Cursors don't snapshot the database, so new
@@ -234,7 +252,7 @@ pub struct MessageList {
     /// Number of AddressBook databases read for contact names; 0 means no names from Contacts.
     pub contacts_databases_read: usize,
     /// Present only when no source or conversation was requested and a store could not be
-    /// read; the other store's results are still returned.
+    /// read; the other stores' results are still returned.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unavailable_sources: Vec<Unavailable>,
 }
