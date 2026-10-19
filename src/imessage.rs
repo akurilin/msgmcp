@@ -137,12 +137,8 @@ fn decode(text: Option<String>, blob: Option<Vec<u8>>) -> (Option<String>, TextS
     let Some(blob) = blob else {
         return (None, TextStatus::NoText);
     };
-    // Read the attributed string's backing text with a typedstream parser.
-    let mut decoder = crabstep::TypedStreamDeserializer::new(&blob);
-    if let Ok(mut properties) = decoder.iter_root()
-        && let Some(text) = properties.find_map(|p| p.as_string().map(str::to_owned))
-    {
-        return (Some(text), TextStatus::Ok);
+    if let Some(text) = crate::attributed_body::text(&blob) {
+        return (Some(text.to_owned()), TextStatus::Ok);
     }
     (None, TextStatus::DecodeFailed)
 }

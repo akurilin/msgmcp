@@ -5,6 +5,7 @@ Every end-to-end test runs twice: against the socket service and against the gat
 """
 import argparse
 import datetime
+import functools
 import json
 import os
 import re
@@ -662,6 +663,15 @@ def im(message, chat):
     return (f'imessage:{message}', f'imessage:{chat}')
 
 
+@functools.lru_cache(maxsize=1)
+def attributed_bodies():
+    """Apple-generated synthetic archives, shared by all tests; never real messages."""
+    generated = subprocess.run(['swift', str(ROOT / 'scripts/fixtures/attributed_body.swift')],
+                               capture_output=True, text=True, check=True, timeout=120)
+    return {sample['name']: (sample['text'], bytes.fromhex(sample['hex']))
+            for sample in json.loads(generated.stdout)}
+
+
 def wa(message, chat):
     return (f'whatsapp:{message}', f'whatsapp:{chat}')
 
@@ -696,7 +706,7 @@ class EndToEnd(unittest.TestCase):
             INSERT INTO handle VALUES ('+15551234567'),('sarah@example.com');
             INSERT INTO chat_handle_join VALUES (1,1),(1,2),(2,2);
         ''')
-        fixture = (ROOT / 'scripts/fixtures/attributed_body').read_bytes()
+        fixture = attributed_bodies()['plain'][1]
         self.db.executemany('INSERT INTO message(guid,date,is_from_me,handle_id,text,attributedBody,associated_message_type,thread_originator_guid) VALUES(?,?,?,?,?,?,?,?)', [
             ('a', DATE, 0, 2, 'Dinner at six', None, 0, None),
             ('b', DATE, 1, 2, 'Dinner works', None, 0, 'a'),
@@ -1761,10 +1771,10 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.ids(messages), [im(1, 1), im(2, 1), im(3, 1), im(4, 1)])
         self.assertEqual(messages[1]['reply_to_guid'], 'a')
         self.assertEqual(messages[0]['sent_at'], timestamp(DATE))
-        self.assertEqual(messages[2]['text'], 'Noter test')
+        self.assertEqual(messages[2]['text'], 'msgmcp synthetic message')
         self.assertEqual(messages[2]['text_status'], 'ok')
         self.assertEqual((messages[3]['text'], messages[3]['text_status']), (None, 'decode_failed'))
-        decoded = self.client.tool('search_messages', text='Noter test')
+        decoded = self.client.tool('search_messages', text='msgmcp synthetic message')
         self.assertEqual(self.ids(decoded['messages']), [im(3, 1)])
         self.assertEqual(decoded['decode_failures'], 1)
         context = self.client.tool('get_message_context', conversation_id='imessage:1',
@@ -1773,6 +1783,40 @@ class EndToEnd(unittest.TestCase):
         first = self.client.tool('get_message_context', conversation_id='imessage:1',
                                  message_id='imessage:1', before=10, after=0)
         self.assertEqual(self.ids(first['messages']), [im(1, 1)])
+
+    def test_apple_generated_attributed_bodies(self):
+        for name, (expected, blob) in attributed_bodies().items():
+            with self.subTest(archive=name):
+                self.db.execute('UPDATE message SET text=NULL, attributedBody=? WHERE rowid=3',
+                                (blob,))
+                self.db.commit()
+                messages = self.client.tool('read_conversation',
+                                            conversation_id='imessage:1')['messages']
+                decoded = next(m for m in messages if m['message_id'] == 'imessage:3')
+                self.assertEqual((decoded['text'], decoded['text_status']), (expected, 'ok'))
+                if expected.strip():
+                    found = self.client.tool('search_messages', conversation_id='imessage:1',
+                                             text=expected)['messages']
+                    self.assertEqual(self.ids(found), [im(3, 1)])
+                context = self.client.tool('get_message_context', conversation_id='imessage:1',
+                                           message_id='imessage:3', before=0, after=0)
+                self.assertEqual(context['messages'][0]['text'], expected)
+
+    def test_plain_text_fallback_and_missing_body(self):
+        valid = attributed_bodies()['plain'][1]
+        for column, blob, expected, status in [
+                ('Plain column wins', b'bad', 'Plain column wins', 'ok'),
+                ('', valid, 'msgmcp synthetic message', 'ok'),
+                (None, None, None, 'no_text'),
+                (None, valid[:-1], None, 'decode_failed')]:
+            with self.subTest(column=column, status=status):
+                self.db.execute('UPDATE message SET text=?, attributedBody=? WHERE rowid=3',
+                                (column, blob))
+                self.db.commit()
+                messages = self.client.tool('read_conversation',
+                                            conversation_id='imessage:1')['messages']
+                decoded = next(m for m in messages if m['message_id'] == 'imessage:3')
+                self.assertEqual((decoded['text'], decoded['text_status']), (expected, status))
 
     def test_missing_and_ambiguous_contacts_keep_addresses(self):
         fallback = self.start_client(self.root / 'missing-contacts')
