@@ -2,7 +2,8 @@
 
 This is the runbook from a fresh checkout to a cloud agent reading your messages. A person
 can follow it alone, or an agent on the Mac (such as Claude Code in this repository) can
-work through it with them. [README.md](README.md) explains what each piece is and why;
+work through it with them, doing the steps in apps and web pages too if it has browser or
+computer use. [README.md](README.md) explains what each piece is and why;
 this file only says what to do and how to tell it worked.
 
 - **Part 1** installs the service on the Mac. Apps on the Mac need only this, then
@@ -14,12 +15,18 @@ this file only says what to do and how to tell it worked.
 
 - **Find out what's already done.** Run each step's check before doing the step, and skip the
   steps that pass. Say which step you're on.
-- **Some steps are the user's.** System Settings, the Tailscale admin console and the agent
-  platform are theirs to click through. Say exactly what to do, wait for them, then run the
-  step's check.
+- **Steps in an app or a web page can be yours.** Some steps happen in Xcode, System
+  Settings, the Tailscale admin console or the agent platform rather than a shell. If you
+  have browser or computer use, offer to do them; otherwise say exactly what to click and
+  wait for the user. Either way, run the step's check afterwards.
+- **Some moments stay with the user.** macOS's own password or Touch ID prompts, signing
+  in to an account, and anything a tool of yours refuses are theirs. Before you save a
+  change that widens or narrows access (the tailnet policy in step 8, a new auth key in
+  step 9), show it and wait for a yes.
 - **Never handle secrets.** The gateway token and the Tailscale auth key go from where
-  they're made straight into the agent platform. Don't read, print or ask for them, and
-  copy the token only with `pbcopy` as shown.
+  they're made straight into the agent platform. Don't read, print, repeat or ask for them,
+  and copy the token only with `pbcopy` as shown. Entering them in the platform (step 10)
+  is the user's job, even when you've done the steps around it.
 - **Print no message data.** The checks here print PASS/FAIL, counts and tool names. Don't
   call tools to show what they return.
 - **Sending is the user's choice.** Ask before adding `--allow-send` (step 7). Never send a
@@ -41,9 +48,9 @@ cargo --version && security find-identity -v -p codesigning
 ```
 
 **Done when** cargo prints a version and at least one identity is listed, such as
-`"Apple Development: jane@example.com (A1B2C3D4E5)"`. Without one, the user makes a free
-one in Xcode: Settings → Accounts → add an Apple ID → Manage Certificates → "+" →
-Apple Development.
+`"Apple Development: jane@example.com (A1B2C3D4E5)"`. Without one, make a free one in
+Xcode: Settings → Accounts → add an Apple ID (the user signs in) → Manage Certificates →
+"+" → Apple Development.
 
 ### 2. Build and install
 
@@ -59,8 +66,9 @@ with a Full Disk Access error. That's expected: go to step 3.
 
 ### 3. Full Disk Access
 
-The user opens System Settings → Privacy & Security → Full Disk Access, clicks "+", presses
-⌘⇧G, enters `~/Applications/msgmcp.app` and turns it on. Then:
+Open System Settings → Privacy & Security → Full Disk Access, click "+", press ⌘⇧G, enter
+`~/Applications/msgmcp.app` and turn it on. macOS asks the user for their password or
+Touch ID. Then:
 
 ```sh
 python3 scripts/reinstall.py
@@ -130,8 +138,9 @@ means `--allow-host` is missing or misspelled.
 
 ### 8. Restrict agents in the tailnet policy
 
-The user opens [Access controls](https://login.tailscale.com/admin/acls) and merges this into
-the policy, with the Mac's address from step 5:
+Open [Access controls](https://login.tailscale.com/admin/acls) and merge this into the
+policy, with the Mac's address from step 5. If you're editing it, show the user the
+change and wait for a yes before saving:
 
 ```jsonc
 {
@@ -163,10 +172,11 @@ policy that fails them. The real check is the agent's in step 12.
 
 ### 9. Make an auth key for agents
 
-The user opens [Keys](https://login.tailscale.com/admin/settings/keys), generates an auth
-key with **Reusable** and **Ephemeral** on and the tag `tag:agent`, and keeps the page open
-for step 10. Keys expire (90 days at most); a new one replaces it in step 10. Without the
-tag, a sandbox joins as one of the user's own devices, with the user's access.
+Open [Keys](https://login.tailscale.com/admin/settings/keys) and generate an auth key with
+**Reusable** and **Ephemeral** on and the tag `tag:agent`. The console shows the key once:
+if you generated it, stop there and leave it on screen for the user to copy in step 10,
+without reading it out. Keys expire (90 days at most); a new one replaces it in step 10.
+Without the tag, a sandbox joins as one of the user's own devices, with the user's access.
 
 ## Part 3: Connect a cloud agent
 
@@ -178,7 +188,9 @@ access to a copy of this repository, such as a GitHub connection. Ask the user w
 platform it is. If you don't know how it does each of these, ask or check its docs; don't
 guess.
 
-Set these in the platform (samples in [.env.example](.env.example)):
+Set these in the platform (samples in [.env.example](.env.example)). You can set up the
+platform and fill in `MSGMCP_URL` and `MSGMCP_AGENT_HOSTNAME`; the user pastes in the two
+secrets:
 
 | Variable | Value |
 | --- | --- |
@@ -189,7 +201,7 @@ Set these in the platform (samples in [.env.example](.env.example)):
 
 ### 11. Give the agent its instruction
 
-Paste this into the agent's chat or saved instructions, with the repository it can read
+Put this in the agent's chat or saved instructions, with the repository it can read
 (`git remote get-url origin` shows this checkout's):
 
 > You can read my iMessage, SMS and WhatsApp history, and send iMessages once I approve
@@ -202,7 +214,7 @@ list from the server; nothing about the tools needs pasting.
 
 ### 12. First session
 
-The user starts a session on the platform and asks the agent to set up msgmcp. **Done
+Start a session on the platform and ask the agent to set up msgmcp. **Done
 when** it reports "All checks passed." On the Mac, its calls show in the audit log:
 
 ```sh
