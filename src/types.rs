@@ -373,6 +373,8 @@ pub enum NameSource {
     /// WhatsApp's address book: the name saved for this number on the user's phone, as
     /// WhatsApp synced it. Not the person's self-chosen WhatsApp profile name.
     Whatsapp,
+    /// Signal: the user's nickname, phone-contact name, profile name or username, in that order.
+    Signal,
     /// Telegram's contacts: the name the user saved for this person in Telegram.
     Telegram,
 }
@@ -382,20 +384,18 @@ pub struct ContactName {
     pub name: String,
     /// "contacts": macOS Contacts, as the user saved it. "whatsapp": WhatsApp's address
     /// book, the name saved for this number on the user's phone as WhatsApp synced it, not
-    /// the person's own profile name. "telegram": the user's Telegram contacts, the name
-    /// the user saved in Telegram. Other address books may be added.
+    /// the person's own profile name. "signal": Signal's nickname, phone-contact name,
+    /// profile name or username, in that order. "telegram": the user's Telegram contacts.
     #[schemars(with = "String")]
     pub source: NameSource,
 }
 
-/// One person, merged from every entry in macOS Contacts, WhatsApp's address book and the
-/// user's Telegram contacts that shares a phone number, email address, WhatsApp JID or
-/// Telegram ID with it.
+/// One person, merged from macOS Contacts and enabled app address books when entries share
+/// a phone number, email address or app ID.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct Contact {
-    /// Every name saved for this person, macOS Contacts first, then WhatsApp, then Telegram,
-    /// each with its source. Two entries that share an address (a family email, say) merge,
-    /// so names can differ.
+    /// Known names: macOS Contacts, WhatsApp, Signal, then Telegram, each with its source.
+    /// Signal may return no name. Shared addresses can merge entries with different names.
     pub names: Vec<ContactName>,
     /// Phone numbers in E.164 when the country is known, otherwise as saved.
     pub phone_numbers: Vec<String>,
@@ -404,6 +404,10 @@ pub struct Contact {
     /// the person isn't in WhatsApp's address book.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub whatsapp_jids: Vec<String>,
+    /// Signal account IDs (ACIs), as lowercase UUIDs. These match message sender
+    /// `signal_id` values. Omitted when the person has no Signal conversation.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub signal_ids: Vec<String>,
     /// Telegram user IDs, as strings, the `telegram_id` that messages from this person carry.
     /// Many Telegram users hide their phone number, so this is often the only way to match
     /// them. Omitted when the person isn't in the user's Telegram contacts.
@@ -426,7 +430,7 @@ pub struct ContactList {
     pub complete: bool,
     /// Number of AddressBook databases read; 0 means nothing from macOS Contacts.
     pub contacts_databases_read: usize,
-    /// Present only when an enabled app's address book (WhatsApp's or Telegram's) could
+    /// Present only when an enabled app's address book (WhatsApp, Signal or Telegram) could
     /// not be read; the results from the other address books are still returned.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unavailable_sources: Vec<Unavailable>,

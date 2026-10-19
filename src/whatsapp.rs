@@ -127,9 +127,10 @@ fn address_book(dir: &Path) -> Result<Vec<AddressBookEntry>> {
         });
         entries.push(AddressBookEntry {
             source: NameSource::Whatsapp,
-            name,
+            name: Some(name),
             phone,
             jids,
+            signal_id: None,
             telegram_id: None,
             telegram_username: None,
         });

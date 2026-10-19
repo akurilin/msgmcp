@@ -16,7 +16,10 @@ use crate::backend::Backend;
 use crate::common::{
     Contacts, Filter, Listed, Page, contact_name, display_address, message_number, neighbors, page,
 };
-use crate::types::{ChatType, Conversation, Kind, Message, Person, Reaction, Source, TextStatus};
+use crate::contacts::AddressBookEntry;
+use crate::types::{
+    ChatType, Conversation, Kind, Message, NameSource, Person, Reaction, Source, TextStatus,
+};
 use anyhow::{Context, Result, bail};
 use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use chrono::{DateTime, Utc};
@@ -40,6 +43,9 @@ pub fn backend(dir: PathBuf) -> Box<dyn Backend> {
 impl Backend for Signal {
     fn check(&self) -> Result<()> {
         open(&self.0).map(drop)
+    }
+    fn address_book(&self) -> Option<Result<Vec<AddressBookEntry>>> {
+        Some(address_book(&self.0))
     }
     fn conversations(
         &self,
@@ -320,6 +326,37 @@ impl Directory {
                 ambiguous: false,
             })
     }
+}
+
+/// Only direct chats the user used belong in contact search. Signal keeps other accounts
+/// in this table after a group message or profile lookup.
+fn address_book(dir: &Path) -> Result<Vec<AddressBookEntry>> {
+    let db = open(dir)?;
+    let directory = Directory::load(&db)?;
+    let mut stmt = db.prepare(&format!(
+        "SELECT c.id FROM conversations c WHERE {CONVERSATION_FILTER} AND c.type='private' AND (c.active_at IS NOT NULL OR EXISTS (SELECT 1 FROM messages m WHERE m.conversationId=c.id AND {MESSAGE_FILTER}))"
+    ))?;
+    let mut rows = stmt.query([])?;
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let Some(profile) = directory.profiles.get(&id) else {
+            continue;
+        };
+        if profile.service_id == directory.me {
+            continue;
+        }
+        entries.push(AddressBookEntry {
+            source: NameSource::Signal,
+            name: profile.name.clone(),
+            phone: profile.e164.as_deref().map(display_address),
+            jids: Vec::new(),
+            signal_id: profile.service_id.clone(),
+            telegram_id: None,
+            telegram_username: None,
+        });
+    }
+    Ok(entries)
 }
 
 fn time(ms: i64) -> Option<DateTime<Utc>> {

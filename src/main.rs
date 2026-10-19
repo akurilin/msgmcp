@@ -184,7 +184,7 @@ struct ContextRequest {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct ContactSearch {
     /// Required. Case-insensitive substring of a name, phone number, email address, WhatsApp
-    /// JID or Telegram username (with or without the `@`), or a whole Telegram user ID.
+    /// JID or Telegram username (with or without the `@`), or a whole Signal or Telegram ID.
     /// Phone numbers match in any format and in part, as in list_conversations.
     query: String,
     /// Most people to return, 1 to 200; default 50.
@@ -507,7 +507,7 @@ impl Server {
     #[tool(
         output_schema = output_schema::<ContactList>(),
         annotations(read_only_hint = true),
-        description = "Look up people in the user's macOS Contacts, WhatsApp's address book and Telegram contacts by name, phone number, email address, WhatsApp JID, Telegram ID or Telegram @username; a query is required. Entries that share a phone number, email address, JID or Telegram ID are merged into one person, and each name carries its source (contacts, whatsapp or telegram). Use it to find someone's number or email for send_message (in_contacts must be true), or the addresses, JIDs and Telegram IDs to look for with list_conversations."
+        description = "Look up people in macOS Contacts, WhatsApp's address book, Signal conversations and Telegram contacts by name, phone number, email address, WhatsApp JID, Signal ID, Telegram ID or Telegram @username; a query is required. Entries that share a phone number, email address or app ID are merged into one person. Each name carries its source (contacts, whatsapp, signal or telegram). Use it to find someone's number or email for send_message (in_contacts must be true), or addresses and IDs for list_conversations."
     )]
     async fn search_contacts(
         &self,
@@ -524,7 +524,7 @@ impl Server {
                     bail!("query is required and must not be empty")
                 }
                 let (records, readable) = load_contact_records(&stores.contacts);
-                // The enabled stores' own address books: WhatsApp's and Telegram's.
+                // Read known people only from enabled apps; report each unavailable store.
                 let (mut books, mut missing, mut books_read) = (Vec::new(), Vec::new(), 0);
                 for (source, backend) in &stores.enabled {
                     match backend.address_book() {

@@ -716,11 +716,12 @@ fn address_book(dir: &Path) -> Result<Vec<AddressBookEntry>> {
         };
         entries.push(AddressBookEntry {
             source: NameSource::Telegram,
-            name,
+            name: Some(name),
             // Digits without the `+`.
             phone: nonempty(&peer.phone)
                 .map(|p| display_address(&format!("+{}", p.trim_start_matches('+')))),
             jids: Vec::new(),
+            signal_id: None,
             telegram_id: Some(telegram_id(id).to_string()),
             telegram_username: username,
         });

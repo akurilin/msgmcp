@@ -191,10 +191,10 @@ def signal_data(db):
         (SIGNAL_SELF, '{}', None, 'private', None, 'Alex', '+15550000000', SIGNAL_ME, None),
         (SIGNAL_MARCO, json.dumps({'unreadCount': 1}), SIG, 'private', 'Marco Phone', 'Marco P',
          '+393331234567', SIGNAL_MARCO_ACI, None),
-        # A hidden number, a nickname the user set, archived and marked unread.
+        # A hidden number, a nickname, and a real message without active_at.
         (SIGNAL_NICK, json.dumps({'nicknameGivenName': 'Nick', 'nicknameFamilyName': 'Name',
                                   'markedUnread': True, 'isArchived': True, 'unreadCount': 0}),
-         SIG, 'private', None, 'Hidden Person', None, SIGNAL_NICK_ACI.upper(), None),
+         None, 'private', None, 'Hidden Person', None, SIGNAL_NICK_ACI.upper(), None),
         (SIGNAL_GROUP, json.dumps({'membersV2': group_members}), SIG, 'group', 'Climbing', None,
          None, None, 'Z3JvdXA='),
         (SIGNAL_REMOVED, json.dumps({'removalStage': 'justNotification'}), SIG, 'private', None,
@@ -226,7 +226,9 @@ def signal_data(db):
         (12, 'sig-12', '{}', 0, SIG + 10000, SIGNAL_REMOVED, 'incoming', 'Removed pizza',
          'e' * 8 + '-0000-4000-8000-000000000000'),
         (13, 'sig-13', '{}', None, SIG + 11000, SIGNAL_NICK, 'outgoing', 'See you at the crag',
-         None)])
+         None),
+        # A service event does not make an unused account a contact.
+        (14, 'sig-14', '{}', None, SIG + 12000, SIGNAL_STRANGER, 'keychange', None, None)])
     # Signal keeps attachments in their own table. A quoted message's thumbnail and an
     # earlier edit's file are not the message's own; GIFs are flagged.
     db.executemany('INSERT INTO message_attachments VALUES(?,?,?,?,?,?,?,?,?,?)', [
@@ -947,6 +949,39 @@ class EndToEnd(unittest.TestCase):
                 self.assertTrue(result['isError'])
                 self.assertIn(expected, result['content'][0]['text'])
 
+    def test_search_contacts_includes_signal_conversations(self):
+        client = self.signal_client()
+        marco = {'names': [{'name': 'Marco Rossi', 'source': 'contacts'},
+                           {'name': 'Marco Phone', 'source': 'signal'}],
+                 'phone_numbers': ['+393331234567'], 'email_addresses': [],
+                 'signal_ids': [SIGNAL_MARCO_ACI], 'in_contacts': True}
+        for query in ('marco', 'Marco Phone', '+39 333 123 4567', '(333) 123-4567',
+                      '393331234567', SIGNAL_MARCO_ACI, SIGNAL_MARCO_ACI.upper()):
+            with self.subTest(query=query):
+                page = client.tool('search_contacts', query=query)
+                self.assertEqual(page['contacts'], [marco])
+                self.assertTrue(page['complete'])
+                self.assertEqual([u['source'] for u in page['unavailable_sources']], ['whatsapp'])
+        nick = {'names': [{'name': 'Nick Name', 'source': 'signal'}],
+                'phone_numbers': [], 'email_addresses': [],
+                'signal_ids': [SIGNAL_NICK_ACI], 'in_contacts': False}
+        for query in ('nick', SIGNAL_NICK_ACI, SIGNAL_NICK_ACI.upper()):
+            with self.subTest(query=query):
+                self.assertEqual(client.tool('search_contacts', query=query)['contacts'], [nick])
+        # A removed chat and an account known only through a group are excluded.
+        for query in ('Stranger', 'Removed', 'ffffffff-0000-4000-8000-000000000000',
+                      'eeeeeeee-0000-4000-8000-000000000000'):
+            with self.subTest(query=query):
+                self.assertEqual(client.tool('search_contacts', query=query)['contacts'], [])
+        self.assertEqual(client.tool('search_contacts', query=SIGNAL_MARCO_ACI[:-1])['contacts'], [])
+        # A disabled Signal source does not add names or IDs.
+        other = self.start_client(self.root / 'contacts', sources=('imessage', 'whatsapp', 'telegram'),
+                                  signal=self.root / 'signal-data')
+        self.assertEqual(other.tool('search_contacts', query='nick')['contacts'], [])
+        self.assertEqual(other.tool('search_contacts', query=SIGNAL_MARCO_ACI)['contacts'], [])
+        self.assertEqual(other.tool('search_contacts', query='marco')['contacts'][0]['names'],
+                         [{'name': 'Marco Rossi', 'source': 'contacts'}])
+
     def test_unreadable_signal_store_is_reported(self):
         wrong_key = signal_fixture(self.root / 'signal-wrong-key', key='f' * 64)
         for signal, error in [(self.root / 'no-signal', 'Signal database not found'),
@@ -969,7 +1004,7 @@ class EndToEnd(unittest.TestCase):
         checked = subprocess.run([str(BINARY), '--check-signal', '--signal', str(store)],
                                  capture_output=True, text=True, timeout=TIMEOUT_SECONDS)
         self.assertEqual(checked.returncode, 0, checked.stderr)
-        self.assertEqual(checked.stdout, 'Signal access succeeded; 3 conversations, 9 messages\n')
+        self.assertEqual(checked.stdout, 'Signal access succeeded; 2 conversations, 9 messages\n')
         missing = subprocess.run([str(BINARY), '--check-signal', '--signal', str(self.root / 'none')],
                                  capture_output=True, text=True, timeout=TIMEOUT_SECONDS)
         self.assertEqual(missing.returncode, 1)
@@ -1492,10 +1527,11 @@ class EndToEnd(unittest.TestCase):
             {'name': 'Other Person', 'source': 'contacts'}, {'name': 'Sarah Test', 'source': 'contacts'}]}])
         # No source readable is an error.
         missing = self.start_client(self.root / 'missing-contacts', self.root / 'missing-whatsapp',
+                                    signal=self.root / 'missing-signal',
                                     telegram=self.root / 'missing-telegram')
         result = missing.request('tools/call', {'name': 'search_contacts', 'arguments': {'query': 'sarah'}})
         self.assertTrue(result['isError'])
-        self.assertIn('Neither macOS Contacts nor the whatsapp or telegram address book',
+        self.assertIn('Neither macOS Contacts nor the whatsapp, signal or telegram address book',
                       result['content'][0]['text'])
 
     def test_search_contacts_includes_telegram_contacts(self):

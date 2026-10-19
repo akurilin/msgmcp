@@ -37,8 +37,7 @@ pub trait Backend: Send + Sync {
         before: usize,
         after: usize,
     ) -> Result<Vec<Message>>;
-    /// The store's own address book, for search_contacts: the people the user saved in
-    /// the app, not everyone it knows.
+    /// People saved in the app or with a real conversation, for search_contacts.
     fn address_book(&self) -> Option<Result<Vec<AddressBookEntry>>> {
         None
     }

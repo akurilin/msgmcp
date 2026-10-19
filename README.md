@@ -3,7 +3,8 @@
 A local MCP server, written in Rust, for message history on a Mac. It reads iMessage
 and SMS from `chat.db`, WhatsApp Desktop from its `ChatStorage.sqlite`, Signal Desktop
 from its encrypted `db.sqlite` and Telegram for macOS from its encrypted Postbox cache, all
-read-only, looks people up in Contacts, WhatsApp's address book and Telegram's contacts,
+read-only, looks people up in Contacts, WhatsApp's address book, Signal conversations and
+Telegram's contacts,
 and sends iMessage text through the Messages app.
 
 ## The problem

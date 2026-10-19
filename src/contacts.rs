@@ -1,17 +1,19 @@
-//! search_contacts: macOS Contacts and the messaging apps' own address books (WhatsApp's,
-//! Telegram's), merged into people.
+//! search_contacts: macOS Contacts and known people from WhatsApp, Signal and Telegram,
+//! merged into people.
 use crate::common::{ContactRecord, address_contains, address_key, display_address};
 use crate::types::{Contact, ContactName, NameSource};
 use std::collections::{BTreeSet, HashMap};
 
-/// One person in a messaging app's own address book.
+/// One person known to an enabled messaging app.
 pub struct AddressBookEntry {
     pub source: NameSource,
-    pub name: String,
+    pub name: Option<String>,
     /// E.164 when the country is known.
     pub phone: Option<String>,
     /// WhatsApp: normalized JIDs, the phone JID and the `@lid` identity.
     pub jids: Vec<String>,
+    /// Signal: the account ID (ACI), a lowercase UUID.
+    pub signal_id: Option<String>,
     /// Telegram: the user ID that Telegram users see.
     pub telegram_id: Option<String>,
     /// Telegram: the public username, without the `@`.
@@ -20,14 +22,15 @@ pub struct AddressBookEntry {
 
 /// One entry from any source, before merging.
 struct Entry {
-    name: ContactName,
+    name: Option<ContactName>,
     addresses: Vec<String>,
     jids: Vec<String>,
+    signal_ids: Vec<String>,
     telegram_ids: Vec<String>,
     telegram_usernames: Vec<String>,
 }
 
-/// Merge entries that share an address, JID or Telegram ID into people and return those matching
+/// Merge entries that share an address or app ID into people and return those matching
 /// `query`, sorted by first name, at most `cap` of them, and whether that was all of them.
 pub fn search(
     records: Vec<ContactRecord>,
@@ -38,28 +41,30 @@ pub fn search(
     let entries: Vec<Entry> = records
         .into_iter()
         .map(|r| Entry {
-            name: ContactName {
+            name: Some(ContactName {
                 name: r.name,
                 source: NameSource::Contacts,
-            },
+            }),
             addresses: r.addresses,
             jids: Vec::new(),
+            signal_ids: Vec::new(),
             telegram_ids: Vec::new(),
             telegram_usernames: Vec::new(),
         })
         .chain(books.into_iter().map(|b| Entry {
-            name: ContactName {
-                name: b.name,
+            name: b.name.map(|name| ContactName {
+                name,
                 source: b.source,
-            },
+            }),
             addresses: b.phone.into_iter().collect(),
             jids: b.jids,
+            signal_ids: b.signal_id.into_iter().collect(),
             telegram_ids: b.telegram_id.into_iter().collect(),
             telegram_usernames: b.telegram_username.into_iter().collect(),
         }))
         .collect();
 
-    // Union-find over entries, joined through every address, JID and Telegram ID they share.
+    // Join entries through addresses and app IDs so each person appears once.
     let mut parent: Vec<usize> = (0..entries.len()).collect();
     fn root(parent: &mut [usize], mut i: usize) -> usize {
         while parent[i] != i {
@@ -80,6 +85,7 @@ pub fn search(
                     .iter()
                     .map(|j| format!("jid:{}", j.to_lowercase())),
             )
+            .chain(entry.signal_ids.iter().map(|id| format!("signal:{id}")))
             .chain(entry.telegram_ids.iter().map(|id| format!("telegram:{id}")));
         for key in keys {
             let first = *owner.entry(key).or_insert(i);
@@ -107,6 +113,9 @@ pub fn search(
                     .chain(&c.email_addresses)
                     .any(|a| address_contains(a, &query))
                 || c.whatsapp_jids.iter().any(|j| j.contains(&query))
+                || c.signal_ids
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case(&query))
                 || c.telegram_ids.contains(&query)
                 || (!username.is_empty()
                     && c.telegram_usernames
@@ -116,7 +125,7 @@ pub fn search(
         .collect();
     people.sort_by_cached_key(|c| {
         (
-            c.names[0].name.to_lowercase(),
+            c.names.first().map(|n| n.name.to_lowercase()),
             c.phone_numbers
                 .first()
                 .or(c.email_addresses.first())
@@ -129,19 +138,13 @@ pub fn search(
 }
 
 fn person(entries: Vec<Entry>) -> Contact {
-    // Sorted and deduplicated: Contacts names, then WhatsApp's, then Telegram's, each
-    // alphabetically.
-    let names: BTreeSet<ContactName> = entries
-        .iter()
-        .map(|e| ContactName {
-            name: e.name.name.clone(),
-            source: e.name.source,
-        })
-        .collect();
+    // Keep each source's distinct name; a Signal account can have no name.
+    let names: BTreeSet<ContactName> = entries.iter().filter_map(|e| e.name.clone()).collect();
     let mut names: Vec<ContactName> = names.into_iter().collect();
     names.sort_by_key(|n| (n.source, n.name.to_lowercase()));
     let (mut phones, mut emails, mut jids) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut telegram_ids, mut telegram_usernames) = (Vec::new(), Vec::new());
+    let (mut signal_ids, mut telegram_ids, mut telegram_usernames) =
+        (Vec::new(), Vec::new(), Vec::new());
     let mut seen = BTreeSet::new();
     for entry in &entries {
         for address in &entry.addresses {
@@ -155,6 +158,7 @@ fn person(entries: Vec<Entry>) -> Contact {
         }
         for (from, to) in [
             (&entry.jids, &mut jids),
+            (&entry.signal_ids, &mut signal_ids),
             (&entry.telegram_ids, &mut telegram_ids),
             (&entry.telegram_usernames, &mut telegram_usernames),
         ] {
@@ -171,6 +175,7 @@ fn person(entries: Vec<Entry>) -> Contact {
         phone_numbers: phones,
         email_addresses: emails,
         whatsapp_jids: jids,
+        signal_ids,
         telegram_ids,
         telegram_usernames,
     }
