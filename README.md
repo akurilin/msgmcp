@@ -184,18 +184,35 @@ gateway directly, or for socket clients the process and the program that started
 tail -f ~/Library/Logs/msgmcp/audit.log
 ```
 
-**Dashboard.** Both services also serve a web page at <http://127.0.0.1:8766/>, always on
-while the service runs: how the service is set up (its endpoint, remote host names, whether
-sending is on, the tools offered), whether each message store and Contacts can be read
-now, and the audit log, with activity over time, a summary per caller and per tool, and
-every event, filterable. It is plain HTML that the service builds on each request, with no
-scripts, and it reloads itself every 30 seconds. `/api/status` and `/api/log` return the
-same data as JSON, and <http://127.0.0.1:8766/?demo=1> shows the page with made-up data,
-for screenshots. It listens on loopback only and refuses any `Host` but its own, so
-neither the tailnet (`tailscale serve` forwards only the gateway's port) nor web pages
-(through DNS rebinding) can read it. It needs no key. `--dashboard ADDRESS` moves it to
-another loopback address; if its port is taken, the service logs that and keeps serving
-MCP without it.
+The [audit dashboard](#audit-dashboard) shows the same log as a summary you can filter.
+
+## Audit dashboard
+
+![The msgmcp dashboard: configuration, message stores, activity chart, and calls by tool and by caller](docs/dashboard.jpg)
+
+*The dashboard showing made-up data from `?demo=1`.*
+
+The service also serves a web page at <http://127.0.0.1:8766/> for reviewing who has been
+using it and what they did. There's nothing to start: it is up whenever the service is.
+
+- **Configuration:** the endpoint, the remote host names, whether sending is on, the tools
+  offered, and whether each message store and Contacts can be read right now.
+- **Activity:** for the last hour, day or week, or everything loaded: tool calls, errors,
+  rejected requests, messages sent and distinct callers; a chart over time; and tables by
+  tool and by caller. Select a tool or caller to filter the event log.
+- **Event log:** every event in the [audit log](#remote-access), filterable by text,
+  outcome, caller and tool. Select a row to see the whole event.
+
+The page is plain HTML that the service builds on each request, with no scripts, and it
+reloads itself every 30 seconds; pause that to keep rows open. `/api/status` and `/api/log`
+return the same data as JSON. `?demo=1` shows the page with made-up data instead of yours,
+for screenshots like the one above.
+
+The dashboard listens on loopback only and refuses any `Host` but its own, so neither the
+tailnet (`tailscale serve` forwards only the gateway's port) nor web pages (through DNS
+rebinding) can read it. It needs no key, so anything else that reaches this Mac's loopback
+can ([Security](#security)). `--dashboard ADDRESS` moves it to another loopback address; if
+its port is taken, the service logs that and keeps serving MCP without it.
 
 ## Security
 

@@ -21,9 +21,11 @@ Run them before every commit, and add a test for every behavior change.
 
 ## Rules
 
-- **Reinstall after every commit to main, without asking.** The service runs only on the
-  user's machine, so reinstalling is always safe, and it keeps the installed service (and
-  what connected clients see) in step with `main`.
+- **Commit finished work on main and reinstall, without asking.** Once the checks above
+  pass, commit to `main` and run `scripts/reinstall.py`; the user doesn't need to approve
+  either. The service runs only on the user's machine, so reinstalling is always safe, and
+  it keeps the installed service (and what connected clients see) in step with `main`.
+  Pushing is still the user's call.
 - **Reinstall only with `scripts/reinstall.py`.** It signs with the installed certificate.
   An ad hoc signature (`install_service.py` with no `--sign`) makes macOS drop the app's
   Full Disk Access, and the user has to grant it again by hand.
