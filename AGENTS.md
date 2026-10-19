@@ -67,8 +67,12 @@ Run them before every commit, and add a test for every behavior change.
 
 ## Running a service by hand
 
+Every service serves the dashboard, on `127.0.0.1:8766` unless `--dashboard` says
+otherwise; pass `--dashboard 127.0.0.1:0` (it prints the URL) so a service started by hand
+or in a test doesn't take the installed service's port.
+
 ```sh
-msgmcp socket --socket /tmp/x/service.sock --source imessage --database /path/chat.db --source signal --signal /path/signal-dir --contacts /path/AddressBook --audit-log /tmp/x/audit.log
+msgmcp socket --socket /tmp/x/service.sock --source imessage --database /path/chat.db --source signal --signal /path/signal-dir --contacts /path/AddressBook --audit-log /tmp/x/audit.log --dashboard 127.0.0.1:0
 msgmcp gateway --listen 127.0.0.1:0 --token-file /tmp/x/token --source imessage --database /path/chat.db ...   # prints its URL
 msgmcp --socket /tmp/x/service.sock                                    # stdio adapter
 msgmcp --url http://127.0.0.1:<port>/mcp --token-file /tmp/x/token      # stdio adapter

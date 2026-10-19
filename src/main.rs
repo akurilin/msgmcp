@@ -4,6 +4,7 @@ mod caller;
 mod client;
 mod common;
 mod contacts;
+mod dashboard;
 mod gateway;
 mod imessage;
 mod signal;
@@ -81,6 +82,8 @@ struct Stores {
     contacts: PathBuf,
     /// In `Source` order.
     enabled: Vec<(Source, Box<dyn Backend>)>,
+    /// Where each enabled store is read from, in the same order.
+    paths: Vec<PathBuf>,
 }
 
 impl Stores {
@@ -331,6 +334,60 @@ impl Server {
             .and_then(|parts| parts.extensions.get::<caller::Caller>())
             .cloned()
             .or_else(|| self.caller.as_deref().cloned())
+    }
+
+    /// The dashboard's status document: how this service is set up, and whether each store
+    /// can be read now. Paths and counts only, never message data.
+    fn status(
+        &self,
+        service: &'static str,
+        endpoint: String,
+        allowed_hosts: Vec<String>,
+    ) -> dashboard::Status {
+        let server = self.clone();
+        let started_at = chrono::Utc::now().to_rfc3339();
+        Arc::new(move || {
+            let stores: Vec<_> = server
+                .stores
+                .enabled
+                .iter()
+                .zip(&server.stores.paths)
+                .map(|((source, backend), path)| {
+                    let found = store(*source);
+                    let error = backend.check().err().map(|e| format!("{e:#}"));
+                    json!({
+                        "source": source,
+                        "names": found.names,
+                        "path": path,
+                        "readable": error.is_none(),
+                        "error": error,
+                    })
+                })
+                .collect();
+            let mut tools: Vec<_> = server
+                .tool_router
+                .list_all()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
+            tools.sort();
+            json!({
+                "service": service,
+                "version": env!("CARGO_PKG_VERSION"),
+                "pid": std::process::id(),
+                "started_at": started_at,
+                "endpoint": endpoint,
+                "allowed_hosts": allowed_hosts,
+                "send_enabled": server.tool_router.has_route("send_message"),
+                "tools": tools,
+                "stores": stores,
+                "contacts": {
+                    "path": server.stores.contacts,
+                    "databases": load_contact_records(&server.stores.contacts).1,
+                },
+                "audit_log": audit::path(),
+            })
+        })
     }
 
     /// Run one tool call off the async runtime and record it in the audit log.
@@ -731,9 +788,10 @@ end timeout"#;
 
 const USAGE: &str = "\
 Services (the LaunchAgent runs one; both serve the same tools):
-msgmcp socket [--socket PATH] [--audit-log PATH] [STORES]
+msgmcp socket [--socket PATH] [--audit-log PATH] [--dashboard ADDRESS] [STORES]
     MCP on a Unix socket, for clients running as this user on this Mac
-msgmcp gateway [--listen ADDRESS] [--allow-host HOST]... [--allow-send] [--token-file PATH] [--audit-log PATH] [STORES]
+msgmcp gateway [--listen ADDRESS] [--allow-host HOST]... [--allow-send] [--token-file PATH] [--audit-log PATH]
+               [--dashboard ADDRESS] [STORES]
     MCP over Streamable HTTP at /mcp, with a bearer token; default address 127.0.0.1:8765.
     send_message is offered only with --allow-send. --allow-host accepts another Host
     name, such as a tailnet name. The token file is created on first start.
@@ -741,8 +799,9 @@ STORES: --source NAME... [--contacts DIRECTORY] {store_options}
     Each --source enables one store ({store_names}); only enabled stores are read, and
     at least one is required. A store's path option replaces its default location.
 Both services append every tool call and rejected request to the audit log, by default
-~/Library/Logs/msgmcp/audit.log. send_message needs --source imessage and only sends to
-addresses saved in Contacts.
+~/Library/Logs/msgmcp/audit.log, and serve a dashboard of their configuration and that
+log at http://127.0.0.1:8766/ (--dashboard moves it; loopback addresses only; no key).
+send_message needs --source imessage and only sends to addresses saved in Contacts.
 
 Clients (they open no database; ENDPOINT is --socket PATH or --url URL [--token-file PATH]):
 msgmcp [ENDPOINT]                     MCP stdio adapter (what MCP clients run)
@@ -810,6 +869,7 @@ async fn main() -> Result<()> {
     let mut audit_log = home.join("Library/Logs/msgmcp/audit.log");
     let (mut socket, mut url, mut token_file) = (None, None, state.join("gateway.token"));
     let mut listen = gateway::DEFAULT_LISTEN.to_owned();
+    let mut dashboard_listen = dashboard::DEFAULT_LISTEN.to_owned();
     let (mut allowed_hosts, mut allow_send) = (Vec::new(), false);
     // Options that only one kind of command accepts, checked once the mode is known.
     let (mut store_option, mut gateway_option) = (None, None);
@@ -851,6 +911,7 @@ async fn main() -> Result<()> {
             }
             "--contacts" => contacts = PathBuf::from(value()?),
             "--audit-log" => audit_log = PathBuf::from(value()?),
+            "--dashboard" => dashboard_listen = value()?,
             "--listen" => listen = value()?,
             "--allow-host" => allowed_hosts.push(value()?),
             "--allow-send" => allow_send = true,
@@ -861,7 +922,7 @@ async fn main() -> Result<()> {
             _ => bail!("Unexpected argument: {arg}\n{}", usage()),
         }
         match arg.as_str() {
-            "--source" | "--contacts" | "--audit-log" => store_option = Some(arg),
+            "--source" | "--contacts" | "--audit-log" | "--dashboard" => store_option = Some(arg),
             "--listen" | "--allow-host" | "--allow-send" => gateway_option = Some(arg),
             _ => {}
         }
@@ -910,6 +971,7 @@ async fn main() -> Result<()> {
             .iter()
             .map(|&source| (source, (store(source).open)(path(source))))
             .collect(),
+        paths: sources.iter().map(|&source| path(source)).collect(),
     };
     match mode {
         Mode::CheckSignal => {
@@ -918,20 +980,29 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Mode::Socket => {
+            let dashboard = dashboard::parse_listen(&dashboard_listen)?;
             let _prompts = signal::disable_keychain_prompts()?;
             audit::init(audit_log, "socket")?;
             let socket = socket.unwrap_or(default_socket);
-            socket::serve(Server::new(stores(), true), socket).await
+            let server = Server::new(stores(), true);
+            let endpoint = socket.display().to_string();
+            dashboard::start(dashboard, server.status("socket", endpoint, Vec::new())).await;
+            socket::serve(server, socket).await
         }
         Mode::Gateway => {
+            let dashboard = dashboard::parse_listen(&dashboard_listen)?;
             let _prompts = signal::disable_keychain_prompts()?;
             audit::init(audit_log, "gateway")?;
+            let server = Server::new(stores(), allow_send);
+            let endpoint = format!("http://{listen}{}", gateway::MCP_PATH);
+            let status = server.status("gateway", endpoint, allowed_hosts.clone());
+            dashboard::start(dashboard, status).await;
             let options = gateway::Options {
                 listen,
                 token_file,
                 allowed_hosts,
             };
-            gateway::serve(Server::new(stores(), allow_send), options).await
+            gateway::serve(server, options).await
         }
         client => {
             if socket.is_some() && url.is_some() {

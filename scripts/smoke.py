@@ -29,6 +29,7 @@ TEMPKEY = ROOT / 'target/debug/examples/telegram_tempkey'
 TIMEOUT_SECONDS = 10
 SOCKET = pathlib.Path.home() / 'Library/Application Support/MSGMCP/run/service.sock'
 GATEWAY_URL = 'http://127.0.0.1:8765/mcp'
+DASHBOARD_URL = 'http://127.0.0.1:8766/'
 SCAN_LIMIT = 10_000
 SOURCES = ('imessage', 'whatsapp', 'signal', 'telegram')
 APPLE_EPOCH = 978_307_200
@@ -731,14 +732,16 @@ class EndToEnd(unittest.TestCase):
         self.client = self.start_client(self.root / 'contacts')
 
     def stores(self, contacts, whatsapp=None, signal=None, sources=SOURCES, telegram=None):
-        """Store options for a service: every path is a fixture, never this Mac's own."""
+        """Store options for a service: every path is a fixture, never this Mac's own, and
+        the dashboard on a free port, never the installed service's."""
         self.audit_log = self.root / 'logs' / 'audit.log'
         paths = {'imessage': ['--database', str(self.path)],
                  'whatsapp': ['--whatsapp', str(whatsapp or self.whatsapp)],
                  'signal': ['--signal', str(signal or self.signal)],
                  'telegram': ['--telegram', str(telegram or self.telegram)]}
         return ([arg for source in sources for arg in ('--source', source, *paths[source])]
-                + ['--contacts', str(contacts), '--audit-log', str(self.audit_log)])
+                + ['--contacts', str(contacts), '--audit-log', str(self.audit_log),
+                   '--dashboard', '127.0.0.1:0'])
 
     def audit(self):
         return [json.loads(line) for line in self.audit_log.read_text().splitlines()]
@@ -751,6 +754,7 @@ class EndToEnd(unittest.TestCase):
         def read():
             log.seek(0)
             return log.read().decode()
+        self.read_service_log = read
         return process, read
 
     def wait_for(self, process, read, ready):
@@ -1243,7 +1247,12 @@ class EndToEnd(unittest.TestCase):
              '--signal requires --source signal'),
             (['gateway', '--source', 'whatsapp', '--allow-send'],
              '--allow-send requires --source imessage'),
-            (['--source', 'imessage'], '--source requires socket or gateway')]
+            (['--source', 'imessage'], '--source requires socket or gateway'),
+            (['--dashboard', '127.0.0.1:0'], '--dashboard requires socket or gateway'),
+            (['socket', '--source', 'imessage', '--dashboard', '0.0.0.0:8766'],
+             'loopback address only'),
+            (['socket', '--source', 'imessage', '--dashboard', 'localhost'],
+             '--dashboard needs an address and port')]
         for args, expected in cases:
             with self.subTest(args=args):
                 result = subprocess.run([str(BINARY), *map(str, args)], capture_output=True,
@@ -1261,7 +1270,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(tuple(re.findall(r'[a-z]+', names.replace(' or ', ', '))), SOURCES)
         given = self.stores(self.root / 'contacts')
         self.assertEqual(options, {a for a in given if a.startswith('--')}
-                         - {'--source', '--contacts', '--audit-log'})
+                         - {'--source', '--contacts', '--audit-log', '--dashboard'})
         self.assertEqual([given[i + 1] for i, a in enumerate(given) if a == '--source'],
                          list(SOURCES))
 
@@ -1595,6 +1604,105 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.audit_log.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.audit_log.parent.stat().st_mode & 0o777, 0o700)
 
+    def dashboard(self, path, **headers):
+        """GET from the dashboard of the service started last: status, headers, body."""
+        url = re.search(r'dashboard listening on (\S+)/', self.read_service_log()).group(1)
+        request = urllib.request.Request(url + path, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.headers, error.read()
+
+    def test_dashboard_page(self):
+        self.client.tool('search_messages', text='<script>alert(1)</script>', limit=1)
+        self.client.request('tools/call', {'name': 'read_conversation',
+                                           'arguments': {'conversation_id': 'imessage:999'}})
+        status, headers, page = self.dashboard('/')
+        self.assertEqual((status, headers['Content-Type']), (200, 'text/html; charset=utf-8'))
+        self.assertEqual(headers['Cache-Control'], 'no-store')
+        # The page is plain HTML: no scripts, and the policy allows none.
+        self.assertNotIn('script-src', headers['Content-Security-Policy'])
+        page = page.decode()
+        self.assertNotIn('<script', page)
+        self.assertIn('&lt;script&gt;alert(1)&lt;/script&gt;', page)
+        self.assertIn(str(self.path), page)
+        self.assertIn('Unknown conversation ID', page)
+        self.assertNotIn('Dinner', page)
+        self.assertEqual(self.dashboard('/app.css')[0], 200)
+        # Filters are query parameters.
+        only_search = self.dashboard('/?tool=search_messages')[2].decode()
+        self.assertNotIn('Unknown conversation ID', only_search)
+        self.assertIn('Unknown conversation ID', self.dashboard('/?outcome=error')[2].decode())
+
+    def test_dashboard_status(self):
+        status, headers, body = self.dashboard('/api/status')
+        self.assertEqual((status, headers['Content-Type']), (200, 'application/json'))
+        info = json.loads(body)
+        self.assertEqual(info['service'], self.TRANSPORT)
+        self.assertEqual(info['audit_log'], str(self.audit_log))
+        self.assertTrue(info['send_enabled'])
+        self.assertIn('send_message', info['tools'])
+        self.assertEqual(info['contacts'], {'path': str(self.root / 'contacts'), 'databases': 1})
+        self.assertEqual([(s['source'], s['readable'], s['error']) for s in info['stores']],
+                         [(source, True, None) for source in SOURCES])
+        self.assertEqual(info['stores'][0]['path'], str(self.path))
+        self.assertEqual(info['stores'][0]['names'], ['iMessage', 'SMS'])
+        # Configuration and counts only, never message data.
+        self.assertNotIn(b'Dinner', body)
+        self.assertNotIn(b'Sarah', body)
+        # A store that can't be read is reported with its error.
+        self.path.unlink()
+        broken = json.loads(self.dashboard('/api/status')[2])['stores'][0]
+        self.assertEqual((broken['source'], broken['readable']), ('imessage', False))
+        self.assertTrue(broken['error'])
+
+    def test_dashboard_log(self):
+        self.client.tool('search_messages', text='dinner', limit=1)
+        self.client.request('tools/call', {'name': 'read_conversation',
+                                           'arguments': {'conversation_id': 'imessage:999'}})
+        log = json.loads(self.dashboard('/api/log')[2])
+        self.assertFalse(log['more'])
+        self.assertEqual(log['events'], self.audit()[::-1])
+        newest = log['events'][0]
+        self.assertEqual((newest['tool'], newest['outcome']), ('read_conversation', 'error'))
+        limited = json.loads(self.dashboard('/api/log?limit=1')[2])
+        self.assertEqual((limited['events'], limited['more']), ([newest], True))
+        # Rotated files are read after the current one; lines that aren't JSON are skipped.
+        older = {'time': '2020-01-01T00:00:00+00:00', 'event': 'tool_call', 'tool': 'old'}
+        self.audit_log.with_suffix('.1.log').write_text(json.dumps(older) + '\n{partial\n')
+        events = json.loads(self.dashboard('/api/log')[2])['events']
+        self.assertEqual(events, self.audit()[::-1] + [older])
+
+    def test_dashboard_refuses_other_hosts(self):
+        port = re.search(r'dashboard listening on http://127\.0\.0\.1:(\d+)/',
+                         self.read_service_log()).group(1)
+        self.assertEqual(self.dashboard('/api/status', Host=f'localhost:{port}')[0], 200)
+        # A page that rebinds its own domain to 127.0.0.1 sends its domain as the Host.
+        for host in (f'rebind.example:{port}', 'localhost', f'localhost:{int(port) + 1}'):
+            with self.subTest(host=host):
+                status, headers, _ = self.dashboard('/api/log', Host=host)
+                self.assertEqual(status, 403)
+                self.assertEqual(headers['X-Frame-Options'], 'DENY')
+        rejected = [e for e in self.audit() if e['event'] == 'rejected']
+        self.assertEqual([(e['reason'], e['status'], e['caller']) for e in rejected],
+                         [('dashboard: host not allowed', 403, {'ip': '127.0.0.1'})] * 3)
+
+    def test_taken_dashboard_port_leaves_the_service_running(self):
+        with socket.socket() as taken:
+            taken.bind(('127.0.0.1', 0))
+            taken.listen()
+            address = '127.0.0.1:%d' % taken.getsockname()[1]
+            process, read = self.start_service(
+                'socket', '--socket', self.root / 'taken' / 'service.sock',
+                *self.stores(self.root / 'contacts')[:-1], address)
+            self.addCleanup(lambda: (process.terminate(), process.wait(TIMEOUT_SECONDS)))
+            self.wait_for(process, read, lambda: (self.root / 'taken' / 'service.sock').exists())
+            self.assertIn(f'dashboard cannot listen on {address}', read())
+            client = Client('--socket', self.root / 'taken' / 'service.sock')
+            self.addCleanup(client.close)
+            self.assertTrue(client.tool('list_conversations', limit=1)['conversations'])
+
     def test_cli_schema_and_call(self):
         described = self.cli('schema')
         self.assertEqual(described.returncode, 0, described.stderr)
@@ -1846,8 +1954,8 @@ class GatewayEndToEnd(EndToEnd):
             process.terminate()
             self.assertEqual(process.wait(timeout=TIMEOUT_SECONDS), 0, read())
         self.addCleanup(stop)
-        self.wait_for(process, read, lambda: 'listening on' in read())
-        url = read().split('listening on ', 1)[1].split()[0]
+        self.wait_for(process, read, lambda: 'gateway listening on' in read())
+        url = read().split('gateway listening on ', 1)[1].split()[0]
         return process, url
 
     def start_client(self, contacts, whatsapp=None, signal=None, sources=SOURCES, telegram=None):
@@ -2015,6 +2123,12 @@ def live(service, sources):
     finally:
         assert client.close() == 0
     print('Live MCP check passed')
+    with urllib.request.urlopen(DASHBOARD_URL + 'api/status', timeout=TIMEOUT_SECONDS) as response:
+        status = json.load(response)
+    assert status['service'] == service, f'dashboard reports the {status["service"]} service'
+    unreadable = [s['source'] for s in status['stores'] if not s['readable']]
+    assert not unreadable, f'dashboard reports unreadable stores: {", ".join(unreadable)}'
+    print(f'Dashboard: {DASHBOARD_URL}')
 
 
 if __name__ == '__main__':

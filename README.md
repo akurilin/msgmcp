@@ -49,6 +49,7 @@ flowchart LR
     keychain[("Keychain<br/>Signal Safe Storage")]
     messages["Messages app"]
     audit[/"Audit log<br/>~/Library/Logs/msgmcp"/]
+    dashboard["Dashboard<br/>127.0.0.1:8766, this Mac only"]
   end
   agent -- "tailnet, tag:agent:<br/>HTTPS to the Mac only" --> serve
   serve --> gateway
@@ -57,6 +58,7 @@ flowchart LR
   app -- "Signal's database key,<br/>after Always Allow" --> keychain
   app -- "Automation: send,<br/>Contacts recipients only" --> messages
   app --> audit
+  audit --> dashboard
 ```
 
 - **One privileged process.** Only `~/Applications/msgmcp.app`, run by a LaunchAgent,
@@ -182,6 +184,18 @@ gateway directly, or for socket clients the process and the program that started
 tail -f ~/Library/Logs/msgmcp/audit.log
 ```
 
+**Dashboard.** Both services also serve a web page at <http://127.0.0.1:8766/>, always on
+while the service runs: how the service is set up (its endpoint, remote host names, whether
+sending is on, the tools offered), whether each message store and Contacts can be read
+now, and the audit log, with activity over time, a summary per caller and per tool, and
+every event, filterable. It is plain HTML that the service builds on each request, with no
+scripts, and it reloads itself every 30 seconds. `/api/status` and `/api/log` return the
+same data as JSON. It listens on loopback only and refuses any `Host` but its own, so
+neither the tailnet (`tailscale serve` forwards only the gateway's port) nor web pages
+(through DNS rebinding) can read it. It needs no key. `--dashboard ADDRESS` moves it to
+another loopback address; if its port is taken, the service logs that and keeps serving
+MCP without it.
+
 ## Security
 
 **Kept out:** the internet. The gateway listens on `127.0.0.1`, `tailscale serve` exposes it
@@ -205,6 +219,9 @@ every call is in the [audit log](#remote-access).
   so an agent can read most of your contacts with a few short queries.
 - **Your accounts.** The agent platform, GitHub and Tailscale can each let someone in.
 - **Programs running as you.** They can read the token and use the socket.
+- **Anything that reaches this Mac's loopback.** The dashboard has no key, so other
+  accounts on the Mac, sandboxed apps, containers and VMs that can reach `127.0.0.1` can
+  read the audit log through it: who asked what, and the text of every message sent.
 
 ## Limits
 
