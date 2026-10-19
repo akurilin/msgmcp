@@ -2,7 +2,9 @@
 
 Read [README.md](README.md) for what this is and how it fits together. This file holds
 what the code doesn't tell you. [agent/README.md](agent/README.md) is a different thing:
-instructions for agents that *use* msgmcp from a cloud sandbox.
+instructions for agents that *use* msgmcp from a cloud sandbox. When the user asks to set
+up msgmcp, give it remote access, or connect a cloud agent, work through
+[SETUP.md](SETUP.md) with them; it is also the one place setup steps are written down.
 
 ## Commands
 

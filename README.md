@@ -49,16 +49,14 @@ flowchart LR
 
 ## Install
 
-```sh
-python3 scripts/reinstall.py --sign "Apple Development: jane@example.com (A1B2C3D4E5)"
-```
+[SETUP.md](SETUP.md) is the step-by-step runbook, from a fresh checkout to a cloud agent
+connected, with a check for each step. An agent on the Mac can work through it with you.
 
-The script builds the release binary, installs `~/Applications/msgmcp.app` and its
-LaunchAgent, and checks that the service can read both stores. List your certificates with
-`security find-identity -v -p codesigning`; a free Apple Development certificate from Xcode
-works. To skip `--sign`, set `MSGMCP_SIGN_IDENTITY` in `.env` (see [.env.example](.env.example)). The first time, grant **msgmcp** Full Disk Access (to read `chat.db` and WhatsApp's
-group container) under System Settings → Privacy & Security, then run the script again.
-Automation → Messages (to send) is requested on the first send.
+In short, `python3 scripts/reinstall.py --sign "<certificate>"` builds the release binary,
+installs `~/Applications/msgmcp.app` and its LaunchAgent, and checks that the service can
+read both stores. The first time, grant **msgmcp** Full Disk Access (to read `chat.db` and
+WhatsApp's group container) and run it again. Automation → Messages (to send) is requested
+on the first send.
 
 **To reinstall after changes**, run `python3 scripts/reinstall.py` with no arguments. It reuses
 the installed app's certificate and service options, so macOS keeps its grants. Options:
@@ -66,9 +64,8 @@ the installed app's certificate and service options, so macOS keeps its grants. 
 replaces the installed set. Restart MCP clients afterwards to pick up tool changes.
 
 macOS ties privacy grants to the app's signature, so the script refuses an ad hoc signature,
-which changes with every build. If the check reports missing Full Disk Access (for example
-after switching certificates), remove **msgmcp** from Full Disk Access with "–", add
-`~/Applications/msgmcp.app` with "+", and run the script again.
+which changes with every build. After switching certificates, macOS drops Full Disk Access
+and it has to be granted again.
 `python3 scripts/install_service.py --uninstall` removes the app and LaunchAgent.
 
 ## Connect a client
@@ -96,43 +93,22 @@ msgmcp call list_conversations '{"query": "sarah"}'
 
 ### A cloud agent
 
-Set up [remote access](#remote-access) first. Then give the agent:
-
-1. **Its environment** ([.env.example](.env.example) has samples of each):
-   - `MSGMCP_URL`: the gateway's tailnet address, such as `https://my-mac.tail4f2e1c.ts.net/mcp`.
-     `tailscale status --self` shows the Mac's name; the tailnet's domain is under DNS in
-     the Tailscale admin console.
-   - `TS_AUTHKEY` (secret): a reusable, ephemeral Tailscale auth key tagged `tag:agent`.
-   - `MSGMCP_TOKEN` (secret): the gateway token. This copies it without printing it:
-     `pbcopy < "$HOME/Library/Application Support/MSGMCP/gateway.token"`
-   - `MSGMCP_AGENT_HOSTNAME` (optional): the sandbox's name on the tailnet and in the audit
-     log; `msgmcp-agent` by default.
-2. **Read access to this repository**, for example through the agent platform's GitHub
-   connection.
-3. **This instruction**, pasted into its chat or saved instructions:
-
-   > You can read my iMessage, SMS and WhatsApp history, and send iMessages once I approve
-   > a draft, through msgmcp. At the start of every session, fetch the `agent/` folder of
-   > github.com/jane-doe/msgmcp fresh and follow `agent/README.md`. If any setup check
-   > fails, stop and tell me.
-
-   Replace `github.com/jane-doe/msgmcp` with the copy of this repository the agent can read.
-
-The agent then joins the tailnet, checks that it is restricted, and reads the tool list
-itself; nothing about the tools needs to be pasted in.
+Follow parts 2 and 3 of [SETUP.md](SETUP.md). The agent gets four environment variables
+([.env.example](.env.example)), read access to this repository, and a short instruction
+to follow [agent/README.md](agent/README.md) each session. It then joins the tailnet,
+checks that it is restricted, and reads the tool list itself; nothing about the tools
+needs to be pasted in.
 
 ## Remote access
 
 The gateway listens on `127.0.0.1` only. To reach it from elsewhere, publish it on a private
-network, for example with `tailscale serve --bg 8765`, and reinstall with
-`--allow-host my-mac.tail4f2e1c.ts.net` (the name `tailscale serve` prints) so the gateway accepts the
-proxied `Host` header. Requests
-from web pages (an `Origin` header) are refused.
+network with `tailscale serve`, and reinstall with `--allow-host` so the gateway accepts the
+proxied `Host` header ([SETUP.md](SETUP.md), steps 5–7). Requests from web pages (an
+`Origin` header) are refused.
 
-For Tailscale, the tailnet policy should give `tag:agent` only `tcp:443` on the Mac, and
-sandboxes join with a reusable, ephemeral auth key tagged `tag:agent`. A device that joins
-untagged counts as one of your own devices and gets your access. To connect an agent, see
-[Connect a client](#a-cloud-agent).
+The tailnet policy gives `tag:agent` only `tcp:443` on the Mac, and sandboxes join with a
+reusable, ephemeral auth key tagged `tag:agent` ([SETUP.md](SETUP.md), steps 8–9). A device
+that joins untagged counts as one of your own devices and gets your access.
 
 Every request needs `Authorization: Bearer <token>`. The gateway creates a random token in
 `~/Library/Application Support/MSGMCP/gateway.token` (mode 0600) on first start; delete the
