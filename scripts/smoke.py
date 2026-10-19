@@ -1060,7 +1060,7 @@ class AgentScript(unittest.TestCase):
 
     # Secrets end in a marker the output must never contain.
     VALID = {'MSGMCP_URL': 'https://my-mac.tail4f2e1c.ts.net/mcp',
-             'TS_AUTHKEY': 'tskey-auth-kQ7pXw2CNTRL-SECRETMARKER',
+             'TS_AUTHKEY': 'tskey-auth-example-SECRETMARKER',
              'MSGMCP_TOKEN': '3f9a1c7e5b2d4f60SECRETMARKER'}
 
     def run_script(self, command, **env):
