@@ -144,6 +144,7 @@ SIGNAL_SCHEMA = '''
     CREATE TABLE conversations(id STRING PRIMARY KEY ASC, json TEXT, active_at INTEGER, type STRING, members TEXT, name TEXT, profileName TEXT, profileFamilyName TEXT, profileFullName TEXT, e164 TEXT, serviceId TEXT, groupId TEXT);
     CREATE TABLE messages(rowid INTEGER PRIMARY KEY ASC, id STRING UNIQUE, json TEXT, readStatus INTEGER, sent_at INTEGER, conversationId STRING, received_at INTEGER, type STRING, body TEXT, sourceServiceId TEXT);
     CREATE TABLE items(id STRING PRIMARY KEY ASC, json TEXT);
+    CREATE TABLE message_attachments(messageId TEXT NOT NULL, editHistoryIndex INTEGER NOT NULL, attachmentType TEXT NOT NULL, orderInMessage INTEGER NOT NULL, conversationId TEXT NOT NULL, sentAt INTEGER NOT NULL, size INTEGER NOT NULL, contentType TEXT NOT NULL, fileName TEXT, flags INTEGER, PRIMARY KEY (messageId, editHistoryIndex, attachmentType, orderInMessage)) STRICT;
 '''
 
 
@@ -177,13 +178,10 @@ def signal_data(db):
         (2, 'sig-2', json.dumps({'quote': {'id': SIG, 'authorAci': SIGNAL_MARCO_ACI}}), None,
          SIG + 1000, SIGNAL_MARCO, 'outgoing', 'Pizza works', None),
         (3, 'sig-3', '{}', None, SIG + 1500, SIGNAL_MARCO, 'keychange', None, None),
-        (4, 'sig-4', json.dumps({'attachments': [{'contentType': 'image/jpeg'}]}), 1,
-         SIG + 2000, SIGNAL_MARCO, 'incoming', None, SIGNAL_MARCO_ACI),
+        (4, 'sig-4', '{}', 1, SIG + 2000, SIGNAL_MARCO, 'incoming', None, SIGNAL_MARCO_ACI),
         (5, 'sig-5', json.dumps({'deletedForEveryone': True}), 0, SIG + 3000, SIGNAL_MARCO,
          'incoming', 'secret original text', SIGNAL_MARCO_ACI),
-        (6, 'sig-6', json.dumps({'attachments': [{'contentType': 'application/pdf',
-                                                  'fileName': 'menu.pdf'}]}), 0,
-         SIG + 4000, SIGNAL_MARCO, 'incoming', None, SIGNAL_MARCO_ACI),
+        (6, 'sig-6', '{}', 0, SIG + 4000, SIGNAL_MARCO, 'incoming', None, SIGNAL_MARCO_ACI),
         (7, 'sig-7', '{}', 0, SIG + 5000, SIGNAL_GROUP, 'incoming', 'Crag at nine',
          SIGNAL_NICK_ACI.upper()),
         (8, 'sig-8', '{}', None, SIG + 6000, SIGNAL_GROUP, 'group-v2-change', None, None),
@@ -197,6 +195,16 @@ def signal_data(db):
          'e' * 8 + '-0000-4000-8000-000000000000'),
         (13, 'sig-13', '{}', None, SIG + 11000, SIGNAL_NICK, 'outgoing', 'See you at the crag',
          None)])
+    # Signal keeps attachments in their own table. A quoted message's thumbnail and an
+    # earlier edit's file are not the message's own; GIFs are flagged.
+    db.executemany('INSERT INTO message_attachments VALUES(?,?,?,?,?,?,?,?,?,?)', [
+        ('sig-2', -1, 'quote', 0, SIGNAL_MARCO, SIG + 1000, 10, 'image/jpeg', None, None),
+        ('sig-4', -1, 'attachment', 0, SIGNAL_MARCO, SIG + 2000, 10, 'image/jpeg', None, None),
+        ('sig-4', -1, 'attachment', 1, SIGNAL_MARCO, SIG + 2000, 10, 'application/pdf', 'x.pdf', None),
+        ('sig-6', 0, 'attachment', 0, SIGNAL_MARCO, SIG + 4000, 10, 'image/png', None, None),
+        ('sig-6', -1, 'attachment', 0, SIGNAL_MARCO, SIG + 4000, 10, 'application/pdf', 'menu.pdf', None),
+        ('sig-7', -1, 'attachment', 0, SIGNAL_GROUP, SIG + 5000, 10, 'video/mp4', None, 8),
+        ('sig-9', -1, 'sticker', 0, SIGNAL_GROUP, SIG + 7000, 10, 'image/webp', None, None)])
 
 
 _encrypted_signal = {}
@@ -598,6 +606,7 @@ class EndToEnd(unittest.TestCase):
                              order='newest_first', limit=2)
         self.assertEqual(self.ids(latest['messages']), [sg(6, SIGNAL_MARCO), sg(5, SIGNAL_MARCO)])
         group = client.tool('read_conversation', conversation_id=f'signal:{SIGNAL_GROUP}')['messages']
+        self.assertEqual([m['kind'] for m in group], ['gif', 'sticker', 'text'])
         self.assertEqual([m['sender'] for m in group], [
             SIGNAL_NICK_PERSON, SIGNAL_UNKNOWN_PERSON,
             {'address': '+15551234567', 'name': None, 'ambiguous': False}])

@@ -8,7 +8,9 @@
 //!   rowid is not stable, since Signal runs VACUUM. `json` holds unread counts, archive
 //!   state, nicknames and group members.
 //! - `messages`: `rowid` is stable. `type` is incoming or outgoing for real messages and
-//!   names the event otherwise; `json` holds quotes, reactions and attachments.
+//!   names the event otherwise; `json` holds quotes, reactions and link previews.
+//! - `message_attachments`: files, stickers and contact cards, one row per attachment;
+//!   `editHistoryIndex` -1 belongs to the message itself rather than an earlier edit.
 //! - `items`: key-value settings, including the user's own account ID.
 use crate::common::{Contacts, Filter, Listed, Page, contact_name, display_address};
 use crate::types::{ChatType, Conversation, Kind, Message, Person, Reaction, Source, TextStatus};
@@ -29,7 +31,7 @@ const CONVERSATION_FILTER: &str =
 // Every other type is an event: group changes, safety-number changes, calls, timers, stories.
 const MESSAGE_FILTER: &str = "m.type IN ('incoming','outgoing') AND m.sent_at IS NOT NULL";
 
-const MESSAGE_SELECT: &str = "SELECT m.rowid, m.id, m.conversationId, m.sent_at, m.type, m.sourceServiceId, m.body, m.readStatus, m.json, (SELECT q.id FROM messages q WHERE q.conversationId=m.conversationId AND q.sent_at=json_extract(m.json,'$.quote.id') AND q.rowid<>m.rowid LIMIT 1) FROM messages m JOIN conversations c ON c.id=m.conversationId";
+const MESSAGE_SELECT: &str = "SELECT m.rowid, m.id, m.conversationId, m.sent_at, m.type, m.sourceServiceId, m.body, m.readStatus, m.json, (SELECT q.id FROM messages q WHERE q.conversationId=m.conversationId AND q.sent_at=json_extract(m.json,'$.quote.id') AND q.rowid<>m.rowid LIMIT 1), (SELECT json_object('type',a.attachmentType,'contentType',a.contentType,'fileName',a.fileName,'flags',a.flags) FROM message_attachments a WHERE a.messageId=m.id AND a.editHistoryIndex=-1 AND a.attachmentType IN ('attachment','sticker','contact') ORDER BY a.orderInMessage LIMIT 1) FROM messages m JOIN conversations c ON c.id=m.conversationId";
 
 /// `encryptedKey` → database key, so the Keychain is asked once per process.
 static KEY_CACHE: Mutex<Option<(String, String)>> = Mutex::new(None);
@@ -278,7 +280,8 @@ fn millis(t: Option<DateTime<Utc>>) -> Option<i64> {
 // Signal's AttachmentPointer flags.
 const GIF_FLAG: u64 = 8;
 
-fn kind(json: &Value) -> Kind {
+/// `attachment` is the message's first file, sticker or contact card.
+fn kind(json: &Value, attachment: &Value) -> Kind {
     let present = |field: &str| match &json[field] {
         Value::Null | Value::Bool(false) => false,
         Value::Array(items) => !items.is_empty(),
@@ -290,13 +293,13 @@ fn kind(json: &Value) -> Kind {
     if present("isViewOnce") || present("poll") {
         return Kind::Other;
     }
-    if present("sticker") {
+    if present("sticker") || attachment["type"] == "sticker" {
         return Kind::Sticker;
     }
-    if present("contact") {
+    if present("contact") || attachment["type"] == "contact" {
         return Kind::Contact;
     }
-    if let Some(attachment) = json["attachments"].as_array().and_then(|a| a.first()) {
+    if attachment["type"] == "attachment" {
         let content_type = attachment["contentType"].as_str().unwrap_or_default();
         let flags = attachment["flags"].as_u64().unwrap_or(0);
         return match content_type.split('/').next() {
@@ -329,16 +332,16 @@ fn message(
         .get::<_, Option<String>>(8)?
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
-    let kind = kind(&json);
+    let attachment: Value = row
+        .get::<_, Option<String>>(10)?
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default();
+    let kind = kind(&json, &attachment);
     let text = match kind {
         Kind::Deleted => None,
-        Kind::Document => body.or_else(|| {
-            nonempty(
-                json["attachments"][0]["fileName"]
-                    .as_str()
-                    .map(str::to_owned),
-            )
-        }),
+        Kind::Document => {
+            body.or_else(|| nonempty(attachment["fileName"].as_str().map(str::to_owned)))
+        }
         Kind::Other => {
             body.or_else(|| nonempty(json["poll"]["question"].as_str().map(str::to_owned)))
         }
