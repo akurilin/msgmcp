@@ -190,7 +190,8 @@ sending is on, the tools offered), whether each message store and Contacts can b
 now, and the audit log, with activity over time, a summary per caller and per tool, and
 every event, filterable. It is plain HTML that the service builds on each request, with no
 scripts, and it reloads itself every 30 seconds. `/api/status` and `/api/log` return the
-same data as JSON. It listens on loopback only and refuses any `Host` but its own, so
+same data as JSON, and <http://127.0.0.1:8766/?demo=1> shows the page with made-up data,
+for screenshots. It listens on loopback only and refuses any `Host` but its own, so
 neither the tailnet (`tailscale serve` forwards only the gateway's port) nor web pages
 (through DNS rebinding) can read it. It needs no key. `--dashboard ADDRESS` moves it to
 another loopback address; if its port is taken, the service logs that and keeps serving

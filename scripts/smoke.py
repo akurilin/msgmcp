@@ -1635,6 +1635,20 @@ class EndToEnd(unittest.TestCase):
         self.assertNotIn('Unknown conversation ID', only_search)
         self.assertIn('Unknown conversation ID', self.dashboard('/?outcome=error')[2].decode())
 
+    def test_dashboard_demo_shows_none_of_this_service(self):
+        self.client.tool('search_messages', text='zebra-marker', limit=1)
+        status, _, page = self.dashboard('/?demo=1&range=7d')
+        page = page.decode()
+        self.assertEqual(status, 200)
+        # Made-up data for screenshots: no path, event or setting of this service.
+        self.assertNotIn(str(self.root), page)
+        self.assertNotIn('zebra-marker', page)
+        self.assertIn('my-mac.tail4f2e1c.ts.net', page)
+        self.assertIn('claude-agent.tail4f2e1c.ts.net', page)
+        # Links and the filter form stay in the demo.
+        self.assertIn('href="/?demo=1&amp;range=1h#activity"', page)
+        self.assertIn('<input type="hidden" name="demo" value="1">', page)
+
     def test_dashboard_status(self):
         status, headers, body = self.dashboard('/api/status')
         self.assertEqual((status, headers['Content-Type']), (200, 'application/json'))

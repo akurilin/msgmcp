@@ -85,6 +85,11 @@ impl Range {
 
 const OUTCOMES: [&str; 4] = ["ok", "error", "rejected", "other"];
 
+/// Whether the query asks for made-up data instead of this service's own.
+pub fn is_demo(query: &[(String, String)]) -> bool {
+    query.iter().any(|(k, v)| k == "demo" && v == "1")
+}
+
 #[derive(Clone)]
 struct Params {
     range: Range,
@@ -94,6 +99,8 @@ struct Params {
     q: String,
     rows: usize,
     refresh: bool,
+    /// Made-up data (`demo=1`), kept by every link.
+    demo: bool,
 }
 
 impl Params {
@@ -123,6 +130,7 @@ impl Params {
                 .filter(|n| *n >= 1)
                 .map_or(DEFAULT_ROWS, |n| n.min(MAX_ROWS)),
             refresh: get("refresh") != Some("0"),
+            demo: is_demo(query),
         }
     }
 
@@ -132,6 +140,9 @@ impl Params {
         let mut p = self.clone();
         change(&mut p);
         let mut pairs = form_urlencoded::Serializer::new(String::new());
+        if p.demo {
+            pairs.append_pair("demo", "1");
+        }
         if p.range != Range::Day {
             pairs.append_pair("range", p.range.key());
         }
@@ -1088,6 +1099,9 @@ fn log(out: &mut String, in_range: &[&Ev], params: &Params, now: DateTime<Local>
     if !params.refresh {
         out.push_str("<input type=\"hidden\" name=\"refresh\" value=\"0\">");
     }
+    if params.demo {
+        out.push_str("<input type=\"hidden\" name=\"demo\" value=\"1\">");
+    }
     let _ = write!(
         out,
         "<input type=\"search\" name=\"q\" value=\"{}\" placeholder=\"Search events\" aria-label=\"Search events\" autocomplete=\"off\" spellcheck=\"false\">",
@@ -1161,7 +1175,12 @@ pub fn render(
             "<meta http-equiv=\"refresh\" content=\"{REFRESH_SECONDS}\">"
         );
     }
-    out.push_str("<title>msgmcp</title><link rel=\"stylesheet\" href=\"/app.css\">");
+    out.push_str(if params.demo {
+        "<title>msgmcp (demo data)</title>"
+    } else {
+        "<title>msgmcp</title>"
+    });
+    out.push_str("<link rel=\"stylesheet\" href=\"/app.css\">");
     out.push_str("<link rel=\"icon\" href=\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%231f6f8b'/%3E%3Cpath d='M4 11V6l4 3 4-3v5' fill='none' stroke='white' stroke-width='1.6'/%3E%3C/svg%3E\">");
     out.push_str("</head><body>");
     header(&mut out, status, &params, now);

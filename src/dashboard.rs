@@ -5,6 +5,7 @@
 //! rebinding, and without CORS headers other origins can't read responses), and `tailscale
 //! serve` forwards only the gateway's port.
 
+mod demo;
 mod page;
 
 use crate::audit;
@@ -107,11 +108,17 @@ fn query(request: &Request) -> Vec<(String, String)> {
 }
 
 /// The page, built here on each request: no scripts, so the browser runs no code from it.
+/// `?demo=1` shows made-up data instead, for screenshots.
 async fn index(State(status): State<Status>, request: Request) -> Response {
     let query = query(&request);
     let rendered = tokio::task::spawn_blocking(move || {
+        let now = chrono::Local::now();
+        if page::is_demo(&query) {
+            let utc = now.to_utc();
+            return page::render(&demo::status(utc), &demo::events(utc), false, &query, now);
+        }
         let (events, more) = audit::recent(PAGE_EVENTS);
-        page::render(&status(), &events, more, &query, chrono::Local::now())
+        page::render(&status(), &events, more, &query, now)
     })
     .await;
     match rendered {
