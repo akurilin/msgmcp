@@ -202,9 +202,9 @@ Without the tag, a sandbox joins as one of the user's own devices, with the user
 
 ### 10. Give the agent its environment
 
-The agent platform must offer a Linux sandbox that runs bash, curl and tar; outbound HTTPS
-(to download Tailscale and join the tailnet); environment variables or secrets; and read
-access to a copy of this repository, such as a GitHub connection. Ask the user which
+The agent platform must offer a Linux sandbox that runs bash, curl, git and tar; outbound
+HTTPS (to fetch the public repository, download Tailscale and join the tailnet); and
+environment variables or secrets. A GitHub connection is not required. Ask the user which
 platform it is. If you don't know how it does each of these, ask or check its docs; don't
 guess.
 
@@ -221,12 +221,11 @@ secrets:
 
 ### 11. Give the agent its instruction
 
-Put this in the agent's chat or saved instructions, with the repository it can read
-(`git remote get-url origin` shows this checkout's):
+Put this in the agent's chat or saved instructions:
 
 > You can read my iMessage, SMS, WhatsApp, Signal and Telegram history, and send iMessages once I approve
-> a draft, through msgmcp. At the start of every session, fetch the `agent/` folder of
-> github.com/jane-doe/msgmcp fresh and follow `agent/README.md`. If any setup check
+> a draft, through msgmcp. At the start of every session, clone
+> https://github.com/akurilin/msgmcp.git and follow `agent/README.md`. If any setup check
 > fails, stop and tell me.
 
 The agent then sets itself up from [agent/README.md](agent/README.md) and reads the tool

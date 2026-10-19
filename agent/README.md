@@ -8,8 +8,10 @@ print, echo, or log either secret, and don't run shell commands with `set -x`.
 
 ## Setup: at the start of every session
 
-Sandboxes are recycled, so do this each session, from a checkout of this repository
-(or a fresh copy of its `agent/` folder, if you fetch files through a GitHub connector):
+Sandboxes are recycled. Fetch a fresh copy of the public repository each session:
+
+    git clone --depth 1 https://github.com/akurilin/msgmcp.git
+    cd msgmcp
 
     source agent/msgmcp.sh && msgmcp_connect && msgmcp_test
 
@@ -18,8 +20,7 @@ FAIL, stop and tell the user which one. Don't work around a failure. In particul
 "this node is tagged tag:agent" or "other ports on the Mac are blocked" fails, don't
 read any messages: the network isn't restricting you as it should.
 
-Fetch the script from this repository each session rather than keeping a copy, so fixes
-reach you.
+If you already have a fresh checkout, use it. Do not keep an old copy of the script.
 
 Once the checks pass, fetch the tool list once for the session with
 `msgmcp_rpc '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'` and use it as the reference

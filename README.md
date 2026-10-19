@@ -133,8 +133,8 @@ msgmcp call list_conversations '{"query": "sarah"}'
 ### A cloud agent
 
 Follow parts 2 and 3 of [SETUP.md](SETUP.md). The agent gets four environment variables
-([.env.example](.env.example)), read access to this repository, and a short instruction
-to follow [agent/README.md](agent/README.md) each session. It then joins the tailnet,
+([.env.example](.env.example)) and a short instruction to fetch the public repository and
+follow [agent/README.md](agent/README.md) each session. It then joins the tailnet,
 checks that it is restricted, and reads the tool list itself; nothing about the tools
 needs to be pasted in.
 
