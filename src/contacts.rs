@@ -1,21 +1,37 @@
-//! search_contacts: macOS Contacts and WhatsApp's address book, merged into people.
+//! search_contacts: macOS Contacts and the messaging apps' own address books (WhatsApp's,
+//! Telegram's), merged into people.
 use crate::common::{ContactRecord, address_contains, address_key, display_address};
 use crate::types::{Contact, ContactName, NameSource};
-use crate::whatsapp::AddressBookEntry;
 use std::collections::{BTreeSet, HashMap};
 
-/// One entry from either source, before merging.
+/// One person in a messaging app's own address book.
+pub struct AddressBookEntry {
+    pub source: NameSource,
+    pub name: String,
+    /// E.164 when the country is known.
+    pub phone: Option<String>,
+    /// WhatsApp: normalized JIDs, the phone JID and the `@lid` identity.
+    pub jids: Vec<String>,
+    /// Telegram: the user ID that Telegram users see.
+    pub telegram_id: Option<String>,
+    /// Telegram: the public username, without the `@`.
+    pub telegram_username: Option<String>,
+}
+
+/// One entry from any source, before merging.
 struct Entry {
     name: ContactName,
     addresses: Vec<String>,
     jids: Vec<String>,
+    telegram_ids: Vec<String>,
+    telegram_usernames: Vec<String>,
 }
 
-/// Merge entries that share an address or JID into people and return those matching
+/// Merge entries that share an address, JID or Telegram ID into people and return those matching
 /// `query`, sorted by first name, at most `cap` of them, and whether that was all of them.
 pub fn search(
     records: Vec<ContactRecord>,
-    whatsapp: Vec<AddressBookEntry>,
+    books: Vec<AddressBookEntry>,
     query: &str,
     cap: usize,
 ) -> (Vec<Contact>, bool) {
@@ -28,18 +44,22 @@ pub fn search(
             },
             addresses: r.addresses,
             jids: Vec::new(),
+            telegram_ids: Vec::new(),
+            telegram_usernames: Vec::new(),
         })
-        .chain(whatsapp.into_iter().map(|w| Entry {
+        .chain(books.into_iter().map(|b| Entry {
             name: ContactName {
-                name: w.name,
-                source: NameSource::Whatsapp,
+                name: b.name,
+                source: b.source,
             },
-            addresses: w.phone.into_iter().collect(),
-            jids: w.jids,
+            addresses: b.phone.into_iter().collect(),
+            jids: b.jids,
+            telegram_ids: b.telegram_id.into_iter().collect(),
+            telegram_usernames: b.telegram_username.into_iter().collect(),
         }))
         .collect();
 
-    // Union-find over entries, joined through every address and JID they share.
+    // Union-find over entries, joined through every address, JID and Telegram ID they share.
     let mut parent: Vec<usize> = (0..entries.len()).collect();
     fn root(parent: &mut [usize], mut i: usize) -> usize {
         while parent[i] != i {
@@ -50,12 +70,17 @@ pub fn search(
     }
     let mut owner = HashMap::new();
     for (i, entry) in entries.iter().enumerate() {
-        let keys = entry.addresses.iter().map(|a| address_key(a)).chain(
-            entry
-                .jids
-                .iter()
-                .map(|j| format!("jid:{}", j.to_lowercase())),
-        );
+        let keys = entry
+            .addresses
+            .iter()
+            .map(|a| address_key(a))
+            .chain(
+                entry
+                    .jids
+                    .iter()
+                    .map(|j| format!("jid:{}", j.to_lowercase())),
+            )
+            .chain(entry.telegram_ids.iter().map(|id| format!("telegram:{id}")));
         for key in keys {
             let first = *owner.entry(key).or_insert(i);
             let (a, b) = (root(&mut parent, first), root(&mut parent, i));
@@ -68,6 +93,8 @@ pub fn search(
     }
 
     let query = query.trim().to_lowercase();
+    // A Telegram username matches with or without its `@`.
+    let username = query.strip_prefix('@').unwrap_or(&query);
     let mut people: Vec<Contact> = groups
         .into_values()
         .map(person)
@@ -80,6 +107,11 @@ pub fn search(
                     .chain(&c.email_addresses)
                     .any(|a| address_contains(a, &query))
                 || c.whatsapp_jids.iter().any(|j| j.contains(&query))
+                || c.telegram_ids.contains(&query)
+                || (!username.is_empty()
+                    && c.telegram_usernames
+                        .iter()
+                        .any(|u| u.to_lowercase().contains(username)))
         })
         .collect();
     people.sort_by_cached_key(|c| {
@@ -97,7 +129,8 @@ pub fn search(
 }
 
 fn person(entries: Vec<Entry>) -> Contact {
-    // Sorted and deduplicated: Contacts names before WhatsApp ones, each alphabetically.
+    // Sorted and deduplicated: Contacts names, then WhatsApp's, then Telegram's, each
+    // alphabetically.
     let names: BTreeSet<ContactName> = entries
         .iter()
         .map(|e| ContactName {
@@ -108,6 +141,7 @@ fn person(entries: Vec<Entry>) -> Contact {
     let mut names: Vec<ContactName> = names.into_iter().collect();
     names.sort_by_key(|n| (n.source, n.name.to_lowercase()));
     let (mut phones, mut emails, mut jids) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut telegram_ids, mut telegram_usernames) = (Vec::new(), Vec::new());
     let mut seen = BTreeSet::new();
     for entry in &entries {
         for address in &entry.addresses {
@@ -119,9 +153,15 @@ fn person(entries: Vec<Entry>) -> Contact {
                 }
             }
         }
-        for jid in &entry.jids {
-            if !jids.contains(jid) {
-                jids.push(jid.clone());
+        for (from, to) in [
+            (&entry.jids, &mut jids),
+            (&entry.telegram_ids, &mut telegram_ids),
+            (&entry.telegram_usernames, &mut telegram_usernames),
+        ] {
+            for value in from {
+                if !to.contains(value) {
+                    to.push(value.clone());
+                }
             }
         }
     }
@@ -131,5 +171,7 @@ fn person(entries: Vec<Entry>) -> Contact {
         phone_numbers: phones,
         email_addresses: emails,
         whatsapp_jids: jids,
+        telegram_ids,
+        telegram_usernames,
     }
 }

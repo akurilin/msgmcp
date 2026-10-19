@@ -15,12 +15,16 @@
 //! - t7: messages, keyed by (peer ID, namespace, timestamp, message ID).
 //! - t8: the chat list: each peer's newest message and folder (1 is the archive).
 //! - t14: read state: unread counts and the newest read message, per peer and namespace.
+//! - t16: the user's Telegram contacts, keyed by big-endian peer ID.
 //!
 //! The database is a cache. Telegram fetches history from its servers as the user scrolls,
 //! so older messages are often missing.
 use crate::backend::Backend;
 use crate::common::{Contacts, Filter, Listed, Page, contact_name, display_address, number, page};
-use crate::types::{ChatType, Conversation, Kind, Message, Person, Reaction, Source, TextStatus};
+use crate::contacts::AddressBookEntry;
+use crate::types::{
+    ChatType, Conversation, Kind, Message, NameSource, Person, Reaction, Source, TextStatus,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::NoPadding};
 use chrono::{DateTime, Utc};
@@ -72,6 +76,9 @@ impl Backend for Telegram {
         after: usize,
     ) -> Result<Vec<Message>> {
         context(&self.0, contacts, conversation, message, (before, after))
+    }
+    fn address_book(&self) -> Option<Result<Vec<AddressBookEntry>>> {
+        Some(address_book(&self.0))
     }
 }
 
@@ -573,55 +580,10 @@ struct Directory {
 
 impl Directory {
     fn load(db: &Connection) -> Result<Directory> {
-        let mut peers = HashMap::new();
-        let mut stmt = db.prepare("SELECT key, value FROM t2")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            let Some((hash, o)) = root(row.get_ref(1)?.as_blob()?) else {
-                continue;
-            };
-            let kind = match hash {
-                h if h == TYPES.user => PeerKind::User,
-                h if h == TYPES.group => PeerKind::Group,
-                h if h == TYPES.channel => PeerKind::Channel {
-                    broadcast: o.i32("i.t") == Some(0),
-                },
-                h if h == TYPES.secret_chat => match o.i64("r") {
-                    Some(user) => PeerKind::Secret(user),
-                    None => continue,
-                },
-                _ => continue,
-            };
-            let text = |key| o.str(key).map(str::to_owned);
-            peers.insert(
-                id,
-                Peer {
-                    kind,
-                    title: text("t"),
-                    first_name: text("fn"),
-                    last_name: text("ln"),
-                    username: text("un"),
-                    phone: text("p"),
-                    automated: matches!(o.get("bi"), Some(Field::Object(..)))
-                        || telegram_id(id) == SERVICE_NOTIFICATIONS,
-                    flagged: o.i32("fl").is_some_and(|f| f & (SCAM | FAKE) != 0),
-                },
-            );
-        }
-        // t16 keys are big-endian peer IDs.
-        let mut contacts = BTreeSet::new();
-        let mut stmt = db.prepare("SELECT key FROM t16")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            if let Ok(key) = <[u8; 8]>::try_from(row.get_ref(0)?.as_blob()?) {
-                contacts.insert(i64::from_be_bytes(key));
-            }
-        }
         Ok(Directory {
             me: own_id(db)?,
-            contacts,
-            peers,
+            contacts: contact_ids(db)?,
+            peers: peers(db)?,
         })
     }
 
@@ -668,6 +630,102 @@ impl Directory {
             ambiguous,
         }
     }
+}
+
+/// Every user, group, channel and secret chat in t2.
+fn peers(db: &Connection) -> Result<HashMap<i64, Peer>> {
+    let mut peers = HashMap::new();
+    let mut stmt = db.prepare("SELECT key, value FROM t2")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let Some((hash, o)) = root(row.get_ref(1)?.as_blob()?) else {
+            continue;
+        };
+        let kind = match hash {
+            h if h == TYPES.user => PeerKind::User,
+            h if h == TYPES.group => PeerKind::Group,
+            h if h == TYPES.channel => PeerKind::Channel {
+                broadcast: o.i32("i.t") == Some(0),
+            },
+            h if h == TYPES.secret_chat => match o.i64("r") {
+                Some(user) => PeerKind::Secret(user),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let text = |key| o.str(key).map(str::to_owned);
+        peers.insert(
+            id,
+            Peer {
+                kind,
+                title: text("t"),
+                first_name: text("fn"),
+                last_name: text("ln"),
+                username: text("un"),
+                phone: text("p"),
+                automated: matches!(o.get("bi"), Some(Field::Object(..)))
+                    || telegram_id(id) == SERVICE_NOTIFICATIONS,
+                flagged: o.i32("fl").is_some_and(|f| f & (SCAM | FAKE) != 0),
+            },
+        );
+    }
+    Ok(peers)
+}
+
+/// The user's Telegram contacts: the peer IDs in t16.
+fn contact_ids(db: &Connection) -> Result<BTreeSet<i64>> {
+    let mut contacts = BTreeSet::new();
+    let mut stmt = db.prepare("SELECT key FROM t16")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if let Ok(key) = <[u8; 8]>::try_from(row.get_ref(0)?.as_blob()?) {
+            contacts.insert(i64::from_be_bytes(key));
+        }
+    }
+    Ok(contacts)
+}
+
+/// Telegram's address book: the user's contacts, under the names the user saved for them,
+/// not every peer Telegram knows.
+fn address_book(dir: &Path) -> Result<Vec<AddressBookEntry>> {
+    let db = open(dir)?;
+    let peers = peers(&db)?;
+    let mut entries = Vec::new();
+    for id in contact_ids(&db)? {
+        let Some(peer) = peers.get(&id) else {
+            continue;
+        };
+        if !matches!(peer.kind, PeerKind::User) {
+            continue;
+        }
+        let nonempty = |s: &Option<String>| {
+            s.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        let full = [&peer.first_name, &peer.last_name]
+            .into_iter()
+            .filter_map(nonempty)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let username = nonempty(&peer.username);
+        let Some(name) = (!full.is_empty()).then_some(full).or(username.clone()) else {
+            continue;
+        };
+        entries.push(AddressBookEntry {
+            source: NameSource::Telegram,
+            name,
+            // Digits without the `+`.
+            phone: nonempty(&peer.phone)
+                .map(|p| display_address(&format!("+{}", p.trim_start_matches('+')))),
+            jids: Vec::new(),
+            telegram_id: Some(telegram_id(id).to_string()),
+            telegram_username: username,
+        });
+    }
+    Ok(entries)
 }
 
 /// The user's own peer ID: the author of their newest outgoing message.

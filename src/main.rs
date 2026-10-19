@@ -183,8 +183,9 @@ struct ContextRequest {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct ContactSearch {
-    /// Required. Case-insensitive substring of a name, phone number, email address or
-    /// WhatsApp JID. Phone numbers match in any format and in part, as in list_conversations.
+    /// Required. Case-insensitive substring of a name, phone number, email address, WhatsApp
+    /// JID or Telegram username (with or without the `@`), or a whole Telegram user ID.
+    /// Phone numbers match in any format and in part, as in list_conversations.
     query: String,
     /// Most people to return, 1 to 200; default 50.
     limit: Option<usize>,
@@ -506,7 +507,7 @@ impl Server {
     #[tool(
         output_schema = output_schema::<ContactList>(),
         annotations(read_only_hint = true),
-        description = "Look up people in the user's macOS Contacts and WhatsApp's address book by name, phone number, email address or WhatsApp JID; a query is required. Entries that share a phone number, email address or JID are merged into one person, and each name carries its source (contacts or whatsapp). Use it to find someone's number or email for send_message (in_contacts must be true), or the addresses to look for with list_conversations."
+        description = "Look up people in the user's macOS Contacts, WhatsApp's address book and Telegram contacts by name, phone number, email address, WhatsApp JID, Telegram ID or Telegram @username; a query is required. Entries that share a phone number, email address, JID or Telegram ID are merged into one person, and each name carries its source (contacts, whatsapp or telegram). Use it to find someone's number or email for send_message (in_contacts must be true), or the addresses, JIDs and Telegram IDs to look for with list_conversations."
     )]
     async fn search_contacts(
         &self,
@@ -523,7 +524,7 @@ impl Server {
                     bail!("query is required and must not be empty")
                 }
                 let (records, readable) = load_contact_records(&stores.contacts);
-                // The enabled stores' own address books; today only WhatsApp has one.
+                // The enabled stores' own address books: WhatsApp's and Telegram's.
                 let (mut books, mut missing, mut books_read) = (Vec::new(), Vec::new(), 0);
                 for (source, backend) in &stores.enabled {
                     match backend.address_book() {
@@ -539,14 +540,17 @@ impl Server {
                     }
                 }
                 if readable == 0 && books_read == 0 {
-                    match missing.first() {
-                        Some(m) => bail!(
-                            "Neither macOS Contacts nor the {} address book could be read: {}",
-                            m.source,
-                            m.error
-                        ),
-                        None => bail!("macOS Contacts could not be read"),
+                    if missing.is_empty() {
+                        bail!("macOS Contacts could not be read")
                     }
+                    let sources: Vec<String> =
+                        missing.iter().map(|m| m.source.to_string()).collect();
+                    let errors: Vec<&str> = missing.iter().map(|m| m.error.as_str()).collect();
+                    bail!(
+                        "Neither macOS Contacts nor the {} address book could be read: {}",
+                        and_list(&sources, "or"),
+                        errors.join("; ")
+                    )
                 }
                 let (contacts, complete) = contacts::search(records, books, &p.query, cap);
                 Ok(ContactList {

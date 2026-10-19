@@ -50,8 +50,9 @@ failed and `.result.content[0].text` says why.
   missing. Telegram chats marked `filtered` are bots, service notices and strangers the
   user never wrote to, mostly spam.
 - For someone's numbers and email addresses, including people with no conversations:
-  search_contacts with their name. Each name says whether it came from macOS Contacts
-  or WhatsApp's address book.
+  search_contacts with their name. Each name says whether it came from macOS Contacts,
+  WhatsApp's address book or the user's Telegram contacts. Telegram contacts often have
+  no phone number; their `telegram_ids` match the `telegram_id` of messages.
 - For recent activity: list_conversations with `active_after`, then read_conversation
   with `order: "newest_first"` and a small `limit`.
 - For what the user hasn't read: list_conversations with `"unread_only": true`. Like the

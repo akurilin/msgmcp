@@ -10,7 +10,10 @@ use crate::common::{
     APPLE_EPOCH, Contacts, Filter, Listed, Page, contact_name, e164, message_number, neighbors,
     number, open, page, probe,
 };
-use crate::types::{ChatType, Conversation, Kind, Message, Person, Reaction, Source, TextStatus};
+use crate::contacts::AddressBookEntry;
+use crate::types::{
+    ChatType, Conversation, Kind, Message, NameSource, Person, Reaction, Source, TextStatus,
+};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
@@ -86,17 +89,8 @@ fn chat_storage(dir: &Path) -> Result<Connection> {
     open(&path)
 }
 
-/// One person in WhatsApp's address book: the name saved for their number on the user's
-/// phone, as WhatsApp synced it.
-pub struct AddressBookEntry {
-    pub name: String,
-    /// E.164.
-    pub phone: Option<String>,
-    /// Normalized JIDs: the phone JID and the `@lid` identity.
-    pub jids: Vec<String>,
-}
-
-/// WhatsApp's address book, from `ContactsV2.sqlite`.
+/// WhatsApp's address book, from `ContactsV2.sqlite`: the name saved for each number on
+/// the user's phone, as WhatsApp synced it.
 fn address_book(dir: &Path) -> Result<Vec<AddressBookEntry>> {
     let path = dir.join("ContactsV2.sqlite");
     if !path.exists() {
@@ -131,7 +125,14 @@ fn address_book(dir: &Path) -> Result<Vec<AddressBookEntry>> {
                 .find_map(|j| j.strip_suffix("@s.whatsapp.net"))
                 .and_then(|d| e164(&format!("+{}", digits(d))))
         });
-        entries.push(AddressBookEntry { name, phone, jids });
+        entries.push(AddressBookEntry {
+            source: NameSource::Whatsapp,
+            name,
+            phone,
+            jids,
+            telegram_id: None,
+            telegram_username: None,
+        });
     }
     Ok(entries)
 }

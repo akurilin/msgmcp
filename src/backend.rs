@@ -1,8 +1,8 @@
 //! The message stores msgmcp can serve. A store is a module that implements `Backend` and
 //! an entry in `STORES`; the tools, cursors, `--source` and the instructions come from here.
 use crate::common::{Contacts, Filter, Listed, Page};
+use crate::contacts::AddressBookEntry;
 use crate::types::{Message, Source};
-use crate::whatsapp::AddressBookEntry;
 use crate::{imessage, signal, telegram, whatsapp};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -37,7 +37,8 @@ pub trait Backend: Send + Sync {
         before: usize,
         after: usize,
     ) -> Result<Vec<Message>>;
-    /// The store's own address book, for search_contacts.
+    /// The store's own address book, for search_contacts: the people the user saved in
+    /// the app, not everyone it knows.
     fn address_book(&self) -> Option<Result<Vec<AddressBookEntry>>> {
         None
     }

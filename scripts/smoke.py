@@ -1140,6 +1140,12 @@ class EndToEnd(unittest.TestCase):
                                                        'arguments': {'source': 'telegram'}})
                 self.assertTrue(result['isError'])
                 self.assertIn(error, result['content'][0]['text'])
+                # search_contacts still answers from macOS Contacts and reports the gap.
+                people = client.tool('search_contacts', query='marco')
+                self.assertEqual([c['names'] for c in people['contacts']],
+                                 [[{'name': 'Marco Rossi', 'source': 'contacts'}]])
+                missing = {u['source']: u['error'] for u in people['unavailable_sources']}
+                self.assertIn(error, missing['telegram'])
 
     def test_telegram_store_is_not_modified(self):
         client = self.telegram_client()
@@ -1150,6 +1156,7 @@ class EndToEnd(unittest.TestCase):
         client.tool('read_conversation', conversation_id=f'telegram:{TG_MARCO}')
         client.tool('get_message_context', conversation_id=f'telegram:{TG_MARCO}',
                     message_id=f'telegram:{TG_MARCO}.0.2')
+        client.tool('search_contacts', query='marco')
         after = {p: p.read_bytes() for p in store.rglob('*') if p.is_file()}
         self.assertEqual({k: after[k] for k in before}, before)
 
@@ -1483,11 +1490,48 @@ class EndToEnd(unittest.TestCase):
         page = self.client.tool('search_contacts', query='sarah@')
         self.assertEqual(page['contacts'], [{**sarah, 'names': [
             {'name': 'Other Person', 'source': 'contacts'}, {'name': 'Sarah Test', 'source': 'contacts'}]}])
-        # Neither source readable is an error.
-        missing = self.start_client(self.root / 'missing-contacts', self.root / 'missing-whatsapp')
+        # No source readable is an error.
+        missing = self.start_client(self.root / 'missing-contacts', self.root / 'missing-whatsapp',
+                                    telegram=self.root / 'missing-telegram')
         result = missing.request('tools/call', {'name': 'search_contacts', 'arguments': {'query': 'sarah'}})
         self.assertTrue(result['isError'])
-        self.assertIn('Neither macOS Contacts nor', result['content'][0]['text'])
+        self.assertIn('Neither macOS Contacts nor the whatsapp or telegram address book',
+                      result['content'][0]['text'])
+
+    def test_search_contacts_includes_telegram_contacts(self):
+        client = self.telegram_client()
+        # Marco is in both, joined by his number, which Telegram stores as bare digits.
+        marco = {'names': [{'name': 'Marco Rossi', 'source': 'contacts'},
+                           {'name': 'Marco TG', 'source': 'telegram'}],
+                 'phone_numbers': ['+393331234567'], 'email_addresses': [],
+                 'telegram_ids': [str(TG_MARCO)], 'telegram_usernames': ['marco_tg'],
+                 'in_contacts': True}
+        for query in ('marco', 'Marco TG', '@marco_tg', 'MARCO_TG', '+39 333 123 4567',
+                      '(333) 123-4567', '393331234567', str(TG_MARCO)):
+            with self.subTest(query=query):
+                page = client.tool('search_contacts', query=query)
+                self.assertEqual(page['contacts'], [marco])
+                # WhatsApp's fixture has no address book; Telegram's was read.
+                self.assertEqual([u['source'] for u in page['unavailable_sources']], ['whatsapp'])
+        # Most Telegram users hide their number: the ID is the only identifier. Dima's is
+        # above 32 bits and reported without Postbox's namespace bits.
+        dima = {'names': [{'name': 'Dima', 'source': 'telegram'}], 'phone_numbers': [],
+                'email_addresses': [], 'telegram_ids': [str(TG_DIMA_ID)], 'in_contacts': False}
+        for query in ('dima', str(TG_DIMA_ID)):
+            with self.subTest(query=query):
+                self.assertEqual(client.tool('search_contacts', query=query)['contacts'], [dima])
+        # An ID matches whole, not in part.
+        self.assertEqual(client.tool('search_contacts', query=str(TG_DIMA_ID)[:-1])['contacts'], [])
+        # Only Telegram contacts: not strangers, bots or channels it merely knows.
+        for query in ('crypto', str(TG_STRANGER), 'pizza', '@pizzanews', 'telegram'):
+            with self.subTest(query=query):
+                self.assertEqual(client.tool('search_contacts', query=query)['contacts'], [])
+        self.assertEqual([c['names'] for c in client.tool('search_contacts', query='friend')['contacts']],
+                         [[{'name': 'Pinned Friend', 'source': 'telegram'}]])
+        # Without Telegram enabled, its contacts aren't read.
+        other = self.start_client(self.root / 'contacts', sources=('imessage', 'whatsapp'),
+                                  telegram=self.root / 'telegram-data')
+        self.assertEqual(other.tool('search_contacts', query='dima')['contacts'], [])
 
     def test_audit_log(self):
         self.client.tool('search_messages', text='dinner', limit=1)
