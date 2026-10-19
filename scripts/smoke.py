@@ -1000,23 +1000,57 @@ class GatewayEndToEnd(EndToEnd):
         self.assertIn('mode 0600', read())
 
 
-
 class AgentScript(unittest.TestCase):
     """agent/msgmcp.sh, as far as it runs without a tailnet."""
+
+    # Secrets end in a marker the output must never contain.
+    VALID = {'MSGMCP_URL': 'https://my-mac.tail4f2e1c.ts.net/mcp',
+             'TS_AUTHKEY': 'tskey-auth-kQ7pXw2CNTRL-SECRETMARKER',
+             'MSGMCP_TOKEN': '3f9a1c7e5b2d4f60SECRETMARKER'}
 
     def run_script(self, command, **env):
         env = {'PATH': os.environ['PATH'], 'HOME': os.environ['HOME'], **env}
         return subprocess.run(['bash', '-c', f'source agent/msgmcp.sh && {command}'], cwd=ROOT,
                               env=env, capture_output=True, text=True, timeout=TIMEOUT_SECONDS)
 
-    def test_requires_gateway_url(self):
-        # No default address: the gateway is on each user's own tailnet.
-        connect = self.run_script('msgmcp_connect', TS_AUTHKEY='tskey-auth-unused')
-        self.assertEqual(connect.returncode, 1)
-        self.assertIn('MSGMCP_URL is not set', connect.stderr)
-        test = self.run_script('msgmcp_test')
-        self.assertEqual(test.returncode, 1)
-        self.assertIn('FAIL MSGMCP_URL is not set', test.stdout)
+    def test_valid_environment_passes_the_check(self):
+        for hostname in ({}, {'MSGMCP_AGENT_HOSTNAME': 'grok-agent-2'}):
+            result = self.run_script('msgmcp_check_env', **self.VALID, **hostname)
+            self.assertEqual((result.returncode, result.stderr), (0, ''))
+
+    def test_bad_environment_fails_every_entry_point_with_its_reason(self):
+        cases = [
+            ({'MSGMCP_URL': None}, 'MSGMCP_URL is not set'),
+            ({'MSGMCP_URL': 'https://my-mac.tail4f2e1c.ts.net/mcp\n'}, 'MSGMCP_URL contains whitespace'),
+            ({'MSGMCP_URL': 'http://my-mac.tail4f2e1c.ts.net/mcp'},
+             'MSGMCP_URL is "http://my-mac.tail4f2e1c.ts.net/mcp"; it must be https://'),
+            ({'MSGMCP_URL': 'https://my-mac.tail4f2e1c.ts.net'},
+             'MSGMCP_URL is "https://my-mac.tail4f2e1c.ts.net"; it must be https://'),
+            ({'TS_AUTHKEY': None}, 'TS_AUTHKEY is not set'),
+            ({'TS_AUTHKEY': 'tskey-auth-SECRETMARKER '}, 'TS_AUTHKEY contains whitespace'),
+            ({'TS_AUTHKEY': 'SECRETMARKER'}, 'TS_AUTHKEY does not start with tskey-'),
+            ({'MSGMCP_TOKEN': None}, 'MSGMCP_TOKEN is not set'),
+            ({'MSGMCP_TOKEN': 'Bearer SECRETMARKER'}, 'MSGMCP_TOKEN contains whitespace'),
+            ({'MSGMCP_AGENT_HOSTNAME': 'grok bot'}, 'MSGMCP_AGENT_HOSTNAME is "grok bot"'),
+        ]
+        for change, reason in cases:
+            env = {k: v for k, v in {**self.VALID, **change}.items() if v is not None}
+            for command in ('msgmcp_connect', 'msgmcp_test', 'msgmcp list_conversations'):
+                with self.subTest(change=change, command=command):
+                    result = self.run_script(command, **env)
+                    self.assertEqual(result.returncode, 1)
+                    output = result.stdout + result.stderr
+                    self.assertIn(('FAIL ' if command == 'msgmcp_test' else '') + reason, output)
+                    self.assertNotIn('SECRETMARKER', output)
+                    # It stops before installing Tailscale or making a request.
+                    self.assertNotIn('curl', output)
+
+    def test_every_problem_is_reported_at_once(self):
+        result = self.run_script('msgmcp_test')
+        self.assertEqual(result.returncode, 1)
+        for name in ('MSGMCP_URL', 'TS_AUTHKEY', 'MSGMCP_TOKEN'):
+            self.assertIn(f'FAIL {name} is not set', result.stdout)
+
 
 def live(service='socket'):
     """Read a little from the installed service; `service` is what the LaunchAgent runs."""

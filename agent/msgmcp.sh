@@ -11,10 +11,37 @@ TS_PROXY=socks5h://localhost:1055
 
 ts() { "$TS_DIR/tailscale" --socket="$TS_SOCK" "$@"; }
 
+# Check the variables above. Prints each problem to stderr and returns 1 if there are any.
+# Shows MSGMCP_URL's value when it is wrong, never a secret's.
+msgmcp_check_env() {
+  local problems=0 example=https://my-mac.tail4f2e1c.ts.net/mcp
+  problem() { echo "$*" >&2; problems=1; }
+  # A value pasted with a trailing newline or space passes a glance but breaks every request.
+  case "$MSGMCP_URL" in
+    '') problem "MSGMCP_URL is not set; set it to the gateway's tailnet address, such as $example" ;;
+    *[[:space:]]*) problem "MSGMCP_URL contains whitespace (a stray space or newline from pasting?)" ;;
+    https://?*/mcp) ;;
+    *) problem "MSGMCP_URL is \"$MSGMCP_URL\"; it must be https://<mac>.<tailnet>.ts.net/mcp, such as $example" ;;
+  esac
+  case "$TS_AUTHKEY" in
+    '') problem "TS_AUTHKEY is not set; set it to a reusable, ephemeral Tailscale auth key tagged tag:agent" ;;
+    *[[:space:]]*) problem "TS_AUTHKEY contains whitespace (a stray space or newline from pasting?)" ;;
+    tskey-?*) ;;
+    *) problem "TS_AUTHKEY does not start with tskey-, so it is not a Tailscale auth key" ;;
+  esac
+  case "$MSGMCP_TOKEN" in
+    '') problem "MSGMCP_TOKEN is not set; set it to the gateway token from the Mac's gateway.token file" ;;
+    *[[:space:]]*) problem "MSGMCP_TOKEN contains whitespace (a stray space or newline from pasting, or a \"Bearer \" prefix?)" ;;
+  esac
+  case "$MSGMCP_AGENT_HOSTNAME" in
+    *[!A-Za-z0-9-]*) problem "MSGMCP_AGENT_HOSTNAME is \"$MSGMCP_AGENT_HOSTNAME\"; use only letters, digits and hyphens, or leave it unset" ;;
+  esac
+  return $problems
+}
+
 # Join the tailnet; safe to rerun. Installs Tailscale into ~/.tailscale and needs no root.
 msgmcp_connect() {
-  [ -n "$MSGMCP_URL" ] || { echo "MSGMCP_URL is not set" >&2; return 1; }
-  [ -n "$TS_AUTHKEY" ] || { echo "TS_AUTHKEY is not set" >&2; return 1; }
+  msgmcp_check_env || return 1
   mkdir -p "$TS_DIR"
   if [ ! -x "$TS_DIR/tailscaled" ]; then
     local arch tarball
@@ -42,6 +69,7 @@ msgmcp_connect() {
 
 # POST one JSON-RPC message to the gateway and print the JSON response.
 msgmcp_rpc() {
+  msgmcp_check_env || return 1
   curl -sS --max-time 60 --proxy "$TS_PROXY" "$MSGMCP_URL" \
     -H "Authorization: Bearer $MSGMCP_TOKEN" \
     -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
@@ -57,10 +85,13 @@ msgmcp() {
 
 # Check the whole path. Prints PASS/FAIL lines and no message contents.
 msgmcp_test() {
-  local failed=0 out code host
+  local failed=0 out code host problem
   pass() { echo "PASS $*"; }
   fail() { echo "FAIL $*"; failed=1; }
-  [ -n "$MSGMCP_URL" ] || { fail "MSGMCP_URL is not set"; return 1; }
+  if ! out=$(msgmcp_check_env 2>&1); then
+    while IFS= read -r problem; do fail "$problem"; done <<<"$out"
+    return 1
+  fi
   host=${MSGMCP_URL#https://}
   host=${host%%/*}
   if ts status >/dev/null 2>&1; then pass "on the tailnet as $(ts ip -4)"; else fail "not on the tailnet; run msgmcp_connect"; return 1; fi
