@@ -1,5 +1,5 @@
 // Generate synthetic archives with Apple's encoder, independently of the Rust reader.
-// No Messages database, crabstep code, or third-party fixture is used.
+// No Messages database or third-party fixture is used.
 // Run on macOS: swift scripts/fixtures/attributed_body.swift
 import AppKit
 

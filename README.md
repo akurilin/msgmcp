@@ -257,6 +257,6 @@ Telegram's open-source client; a Telegram update that changes it shows up as
 
 ## License
 
-GPL-3.0-or-later. iMessage attributed-body text is decoded by a focused Rust reader.
+MIT. iMessage attributed-body text is decoded by a focused Rust reader.
 Its test archives are generated from synthetic strings by Apple's `NSArchiver`, using
 `scripts/fixtures/attributed_body.swift`; no message database is needed.
