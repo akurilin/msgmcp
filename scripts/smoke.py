@@ -666,8 +666,12 @@ def im(message, chat):
 @functools.lru_cache(maxsize=1)
 def attributed_bodies():
     """Apple-generated synthetic archives, shared by all tests; never real messages."""
-    generated = subprocess.run(['swift', str(ROOT / 'scripts/fixtures/attributed_body.swift')],
-                               capture_output=True, text=True, check=True, timeout=120)
+    # Keep Swift's module cache in the test's writable temporary directory.
+    with tempfile.TemporaryDirectory(prefix='msgmcp-swift-') as cache:
+        generated = subprocess.run([
+            'swift', '-module-cache-path', cache,
+            str(ROOT / 'scripts/fixtures/attributed_body.swift')],
+            capture_output=True, text=True, check=True, timeout=120)
     return {sample['name']: (sample['text'], bytes.fromhex(sample['hex']))
             for sample in json.loads(generated.stdout)}
 

@@ -494,7 +494,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn matches_apple_archives() {
+        // Swift must write its module cache where a sandboxed test can write.
+        let cache = std::env::temp_dir().join(format!("msgmcp-swift-cache-{}", std::process::id()));
         let generated = std::process::Command::new("swift")
+            .arg("-module-cache-path")
+            .arg(cache)
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/scripts/fixtures/attributed_body.swift"
