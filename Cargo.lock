@@ -284,12 +284,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crabstep"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "467f22dc270d723f04bd12dcb8aa925682ce293ea9d12189f998af7cbe15b62c"
-
-[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1002,7 +996,6 @@ dependencies = [
  "axum",
  "cbc",
  "chrono",
- "crabstep",
  "glob",
  "libc",
  "pbkdf2",
