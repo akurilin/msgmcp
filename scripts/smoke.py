@@ -7,6 +7,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import shutil
 import pathlib
 import select
@@ -25,10 +26,9 @@ BINARY = ROOT / 'target/debug/msgmcp'
 ENCRYPT = ROOT / 'target/debug/examples/sqlcipher_encrypt'
 TIMEOUT_SECONDS = 10
 SOCKET = pathlib.Path.home() / 'Library/Application Support/MSGMCP/run/service.sock'
-# The live check reads Signal only where Signal Desktop is set up.
-SIGNAL_DATABASE = pathlib.Path.home() / 'Library/Application Support/Signal/sql/db.sqlite'
 GATEWAY_URL = 'http://127.0.0.1:8765/mcp'
 SCAN_LIMIT = 10_000
+SOURCES = ('imessage', 'whatsapp', 'signal')
 APPLE_EPOCH = 978_307_200
 NANOS_PER_SECOND = 1_000_000_000
 DATE = 800_000_000 * NANOS_PER_SECOND
@@ -442,11 +442,14 @@ class EndToEnd(unittest.TestCase):
         self.signal = signal_fixture(self.root / 'signal', data=False)
         self.client = self.start_client(self.root / 'contacts')
 
-    def stores(self, contacts, whatsapp=None, signal=None):
+    def stores(self, contacts, whatsapp=None, signal=None, sources=SOURCES):
+        """Store options for a service: every path is a fixture, never this Mac's own."""
         self.audit_log = self.root / 'logs' / 'audit.log'
-        return ['--database', str(self.path), '--contacts', str(contacts),
-                '--whatsapp', str(whatsapp or self.whatsapp),
-                '--signal', str(signal or self.signal), '--audit-log', str(self.audit_log)]
+        paths = {'imessage': ['--database', str(self.path)],
+                 'whatsapp': ['--whatsapp', str(whatsapp or self.whatsapp)],
+                 'signal': ['--signal', str(signal or self.signal)]}
+        return ([arg for source in sources for arg in ('--source', source, *paths[source])]
+                + ['--contacts', str(contacts), '--audit-log', str(self.audit_log)])
 
     def audit(self):
         return [json.loads(line) for line in self.audit_log.read_text().splitlines()]
@@ -468,11 +471,11 @@ class EndToEnd(unittest.TestCase):
                 self.fail('Service startup failed: ' + read())
             time.sleep(0.01)
 
-    def start_client(self, contacts, whatsapp=None, signal=None):
+    def start_client(self, contacts, whatsapp=None, signal=None, sources=SOURCES):
         run = self.root / ('run-' + str(len(list(self.root.glob('run-*')))))
         socket = run / 'service.sock'
         process, read = self.start_service('socket', '--socket', socket,
-                                           *self.stores(contacts, whatsapp, signal))
+                                           *self.stores(contacts, whatsapp, signal, sources))
         def stop():
             process.terminate()
             process.wait(timeout=TIMEOUT_SECONDS)
@@ -695,6 +698,76 @@ class EndToEnd(unittest.TestCase):
                     message_id='signal:2')
         after = {p.name: p.read_bytes() for p in store.rglob('*') if p.is_file()}
         self.assertEqual({k: after[k] for k in before}, before)
+
+    def test_only_enabled_sources_are_read(self):
+        client = self.start_client(self.root / 'contacts', sources=('imessage',))
+        chats = client.tool('list_conversations')
+        self.assertEqual([c['conversation_id'] for c in chats['conversations']],
+                         ['imessage:1', 'imessage:2'])
+        self.assertNotIn('unavailable_sources', chats)
+        found = client.tool('search_messages', text='dinner')
+        self.assertEqual({m['source'] for m in found['messages']}, {'imessage'})
+        self.assertNotIn('unavailable_sources', found)
+        # Without WhatsApp, search_contacts reads macOS Contacts alone and reports nothing missing.
+        people = client.tool('search_contacts', query='marco')
+        self.assertEqual(people['contacts'][0]['names'], [{'name': 'Marco Rossi', 'source': 'contacts'}])
+        self.assertNotIn('unavailable_sources', people)
+        instructions = client.initialized['instructions']
+        self.assertIn('the user’s iMessage and SMS history', instructions)
+        self.assertNotIn('WhatsApp', instructions)
+        self.assertNotIn('a person can have', instructions)
+        self.assertIn('send_message', {t['name'] for t in client.request('tools/list', {})['tools']})
+        for name, arguments in [
+                ('list_conversations', {'source': 'whatsapp'}),
+                ('read_conversation', {'conversation_id': 'whatsapp:1'}),
+                ('search_messages', {'text': 'pizza', 'source': 'signal'}),
+                ('get_message_context', {'conversation_id': 'whatsapp:1', 'message_id': 'whatsapp:2'})]:
+            with self.subTest(tool=name, arguments=arguments):
+                result = client.request('tools/call', {'name': name, 'arguments': arguments})
+                self.assertTrue(result['isError'])
+                self.assertIn('is not enabled on this Mac; this service reads imessage',
+                              result['content'][0]['text'])
+
+    def test_without_imessage_nothing_can_be_sent(self):
+        client = self.start_client(self.root / 'contacts', sources=('whatsapp', 'signal'))
+        self.assertNotIn('send_message', {t['name'] for t in client.request('tools/list', {})['tools']})
+        instructions = client.initialized['instructions']
+        self.assertIn('the user’s WhatsApp and Signal history', instructions)
+        self.assertIn('a person can have a whatsapp: and a signal: conversation', instructions)
+        self.assertIn('such as whatsapp:45 or signal:<uuid>.', instructions)
+        self.assertNotIn('Send messages', instructions)
+        self.assertEqual({c['source'] for c in client.tool('list_conversations')['conversations']},
+                         {'whatsapp'})
+
+    def test_service_options_are_checked(self):
+        cases = [
+            (['socket'], 'Choose the message stores to serve with --source'),
+            (['socket', '--source', 'telegram'], 'Unknown source "telegram"'),
+            (['socket', '--source', 'imessage', '--signal', self.root / 'signal'],
+             '--signal requires --source signal'),
+            (['gateway', '--source', 'whatsapp', '--allow-send'],
+             '--allow-send requires --source imessage'),
+            (['--source', 'imessage'], '--source requires socket or gateway')]
+        for args, expected in cases:
+            with self.subTest(args=args):
+                result = subprocess.run([str(BINARY), *map(str, args)], capture_output=True,
+                                        text=True, timeout=TIMEOUT_SECONDS)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(expected, result.stderr)
+
+    def test_harness_passes_every_store_option(self):
+        # A service falls back to this Mac's own stores for any path not given, so the
+        # harness must pass every store's option; this catches a store added without one.
+        usage = subprocess.run([str(BINARY), '--help'], capture_output=True, text=True).stderr
+        line = next(l for l in usage.splitlines() if l.startswith('STORES:'))
+        options = set(re.findall(r'\[(--[a-z-]+) ', line)) - {'--contacts'}
+        names = re.search(r'enables one store \(([^)]*)\)', usage).group(1)
+        self.assertEqual(tuple(re.findall(r'[a-z]+', names.replace(' or ', ', '))), SOURCES)
+        given = self.stores(self.root / 'contacts')
+        self.assertEqual(options, {a for a in given if a.startswith('--')}
+                         - {'--source', '--contacts', '--audit-log'})
+        self.assertEqual([given[i + 1] for i, a in enumerate(given) if a == '--source'],
+                         list(SOURCES))
 
     def test_search_across_sources(self):
         self.db.execute("INSERT INTO message(guid,date,is_from_me,handle_id,text,attributedBody,associated_message_type,thread_originator_guid) VALUES('p',?,0,2,'Pizza place?',NULL,0,NULL)",
@@ -1229,11 +1302,11 @@ class EndToEnd(unittest.TestCase):
 class GatewayEndToEnd(EndToEnd):
     TRANSPORT = 'gateway'
 
-    def start_gateway(self, contacts, whatsapp=None, *options, signal=None):
+    def start_gateway(self, contacts, whatsapp=None, *options, signal=None, sources=SOURCES):
         self.token_file = self.root / 'gateway' / 'token'
         process, read = self.start_service(
             'gateway', '--listen', '127.0.0.1:0', '--token-file', self.token_file,
-            *options, *self.stores(contacts, whatsapp, signal))
+            *options, *self.stores(contacts, whatsapp, signal, sources))
         def stop():
             process.terminate()
             self.assertEqual(process.wait(timeout=TIMEOUT_SECONDS), 0, read())
@@ -1242,9 +1315,12 @@ class GatewayEndToEnd(EndToEnd):
         url = read().split('listening on ', 1)[1].split()[0]
         return process, url
 
-    def start_client(self, contacts, whatsapp=None, signal=None):
-        # The socket suite exercises send_message's schema, so offer it here too.
-        process, self.url = self.start_gateway(contacts, whatsapp, '--allow-send', signal=signal)
+    def start_client(self, contacts, whatsapp=None, signal=None, sources=SOURCES):
+        # The socket suite exercises send_message's schema, so offer it here too; only
+        # iMessage can send.
+        send = ['--allow-send'] if 'imessage' in sources else []
+        process, self.url = self.start_gateway(contacts, whatsapp, *send, signal=signal,
+                                               sources=sources)
         self.assertEqual(self.token_file.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.token_file.parent.stat().st_mode & 0o777, 0o700)
         self.token = self.token_file.read_text().strip()
@@ -1386,10 +1462,10 @@ class AgentScript(unittest.TestCase):
             self.assertIn(f'FAIL {name} is not set', result.stdout)
 
 
-def live(service='socket'):
-    """Read a little from the installed service; `service` is what the LaunchAgent runs."""
+def live(service, sources):
+    """Read a little from each store the installed service serves; `service` is what the
+    LaunchAgent runs."""
     client = Client(*(['--socket', SOCKET] if service == 'socket' else ['--url', GATEWAY_URL]))
-    sources = ['imessage', 'whatsapp'] + (['signal'] if SIGNAL_DATABASE.exists() else [])
     try:
         for source in sources:
             chats = client.tool('list_conversations', source=source, limit=2)
@@ -1421,4 +1497,5 @@ if __name__ == '__main__':
     if not result.wasSuccessful():
         raise SystemExit(1)
     if args.live:
-        live(args.live)
+        import install_service
+        live(args.live, install_service.installed_sources() or install_service.LEGACY_SOURCES)

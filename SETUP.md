@@ -29,6 +29,8 @@ this file only says what to do and how to tell it worked.
   is the user's job, even when you've done the steps around it.
 - **Print no message data.** The checks here print PASS/FAIL, counts and tool names. Don't
   call tools to show what they return.
+- **Each message store is the user's choice.** Ask which of iMessage/SMS, WhatsApp and
+  Signal agents may read (step 2); serve only those.
 - **Sending is the user's choice.** Ask before adding `--allow-send` (step 7). Never send a
   real message during setup.
 - **Stop on a failure you can't explain.** Report the command and its error. Don't work
@@ -60,13 +62,24 @@ python3 scripts/reinstall.py --sign "Apple Development: jane@example.com (A1B2C3
 
 Use the identity from step 1, in full. Later runs reuse the installed app's certificate, so
 `--sign` is needed only this once (or set `MSGMCP_SIGN_IDENTITY` in `.env`; see
-[.env.example](.env.example)). The script builds, installs `~/Applications/msgmcp.app` and
-its LaunchAgent, then reads a little from both stores. On a first install it stops there
-with a Full Disk Access error. That's expected: go to step 3.
+[.env.example](.env.example)).
+
+On a first install it stops before building and lists the message stores found on this Mac.
+Ask the user which ones agents may read, then run it again with a `--source` for each, such
+as:
+
+```sh
+python3 scripts/reinstall.py --sign "Apple Development: jane@example.com (A1B2C3D4E5)" --source imessage --source whatsapp
+```
+
+Later runs keep these stores; passing `--source` again replaces the set. The script builds,
+installs `~/Applications/msgmcp.app` and its LaunchAgent, then reads a little from each
+store. When it serves iMessage or WhatsApp, a first install stops there with a Full Disk
+Access error. That's expected: go to step 3.
 
 ### 3. Full Disk Access
 
-Open System Settings → Privacy & Security → Full Disk Access, click "+", press ⌘⇧G, enter
+Needed for iMessage and WhatsApp; Signal's folder isn't protected. Open System Settings → Privacy & Security → Full Disk Access, click "+", press ⌘⇧G, enter
 `~/Applications/msgmcp.app` and turn it on. macOS asks the user for their password or
 Touch ID. Then:
 
@@ -79,12 +92,11 @@ still reports Full Disk Access, remove **msgmcp** from the list with "–", add 
 and rerun. The check also reads WhatsApp Desktop, so on a Mac without WhatsApp Desktop it
 fails there; tell the user rather than working around it.
 
-With Signal Desktop set up, the script also prints "Checking Signal", before the Full Disk
+When it serves Signal, the script also prints "Checking Signal", before the Full Disk
 Access check, and the first time (in step 2 or here) macOS asks whether msgmcp may use
 "Signal Safe Storage" from the Keychain. The user chooses **Always Allow** (macOS may ask
 for their login password). It prints "Signal access succeeded" with counts, and later runs
-don't ask again. If they chose Deny, rerun the script. Without Signal Desktop this is
-skipped.
+don't ask again. If they chose Deny, rerun the script.
 
 Apps on this Mac can connect now: see [Connect a client](README.md#apps-on-this-mac).
 
@@ -247,7 +259,10 @@ A FAIL from the agent points back to a step:
 - **Rotate the gateway token:** delete `~/Library/Application Support/MSGMCP/gateway.token`,
   run `launchctl kickstart -k gui/$(id -u)/local.msgmcp.service`, then replace
   `MSGMCP_TOKEN` in every agent platform.
-- **After code changes:** `python3 scripts/reinstall.py` keeps the certificate and options.
+- **After code changes:** `python3 scripts/reinstall.py` keeps the certificate, stores and
+  options.
+- **Serve another store:** `python3 scripts/reinstall.py --source imessage --source signal`,
+  listing every store to serve.
 - **Remove it all:** `python3 scripts/install_service.py --uninstall`, then
   `tailscale serve reset` (which removes everything `tailscale serve` publishes) and the
   policy rules from step 8.

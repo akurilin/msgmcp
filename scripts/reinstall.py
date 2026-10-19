@@ -4,9 +4,10 @@
 macOS ties Full Disk Access to the app's signature, so this always signs with the same
 certificate and refuses an ad hoc signature. The identity comes from --sign, else
 MSGMCP_SIGN_IDENTITY in .env, else the certificate the installed app is already signed
-with. After installing it checks the signature and that the service can read both stores.
+with. After installing it checks the signature and that the service can read its stores.
 The LaunchAgent keeps running the installed service command (the gateway on a first install)
-unless --service, --allow-host or --allow-send is given, which replaces it.
+unless --service, --allow-host or --allow-send is given, which replaces it. It keeps serving
+the installed stores unless --source is given; a first install needs --source.
 """
 import argparse
 import socket
@@ -59,6 +60,24 @@ def choose_identity(requested):
     return identity
 
 
+def choose_sources(requested):
+    """The stores to serve: --source, else the installed ones. Never adds one by itself."""
+    detected = install_service.detected_sources()
+    sources = requested or install_service.installed_sources()
+    if not sources:
+        raise SystemExit(
+            'Choose the message stores agents may read. Found on this Mac: '
+            + ', '.join(detected) + '.\nRun this again with '
+            + ' '.join(f'--source {s}' for s in detected)
+            + ', leaving out any you don\'t want served.')
+    unserved = [s for s in detected if s not in sources]
+    if unserved and not requested:
+        print(f'Not serving {", ".join(unserved)}, which is on this Mac. To serve it, run this '
+              'again with --source for every store: '
+              + ' '.join(f'--source {s}' for s in [*sources, *unserved]))
+    return sources
+
+
 def wait_for_service(service):
     deadline = time.monotonic() + STARTUP_SECONDS
     while True:
@@ -85,22 +104,29 @@ if __name__ == '__main__':
                         help='extra Host name the gateway accepts, such as a tailnet name; repeatable')
     parser.add_argument('--allow-send', action='store_true',
                         help='let gateway clients use send_message (Contacts recipients only)')
+    parser.add_argument('--source', action='append', choices=install_service.SOURCES, default=[],
+                        help='a message store to serve; repeatable, replaces the installed set')
     args = parser.parse_args()
+    sources = choose_sources(args.source)
+    # Settle the command first, so a refused combination of options fails before the build.
+    installed = install_service.installed_command()
+    if args.service or args.allow_host or args.allow_send:
+        command = install_service.service_command(args.service or 'gateway', args.allow_host,
+                                                  args.allow_send, sources)
+    elif installed:
+        command = install_service.with_sources(installed, sources)
+    else:
+        command = install_service.service_command(sources=sources)
     identity = choose_identity(args.sign)
     print(f'Signing with: {identity}')
     subprocess.run(['cargo', 'build', '--release', '--locked'], cwd=install_service.ROOT, check=True)
     install_service.check_paths()
-    if args.service or args.allow_host or args.allow_send:
-        command = install_service.service_command(args.service or 'gateway', args.allow_host,
-                                                  args.allow_send)
-    else:
-        command = install_service.installed_command() or install_service.service_command()
     install_service.install(install_service.ROOT / 'target/release/msgmcp', identity, command)
     if installed_identity() is None:
         raise SystemExit(f'{install_service.APP} is not certificate-signed')
     wait_for_service(command[0])
     smoke.BINARY = install_service.APP / 'Contents/MacOS/msgmcp'
-    if smoke.SIGNAL_DATABASE.exists():
+    if 'signal' in sources:
         # The service never shows Keychain dialogs, so ask here, where the user is. After
         # Always Allow this prints counts without asking.
         print('Checking Signal; if macOS asks about "Signal Safe Storage", choose Always Allow.')
@@ -108,7 +134,7 @@ if __name__ == '__main__':
             raise SystemExit('msgmcp cannot read Signal. Run this again and choose Always Allow, '
                              'or see SETUP.md, step 3.')
     try:
-        smoke.live(command[0])
+        smoke.live(command[0], sources)
     except AssertionError as error:
         if 'Full Disk Access' not in str(error):
             raise

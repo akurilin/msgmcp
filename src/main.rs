@@ -1,4 +1,5 @@
 mod audit;
+mod backend;
 mod caller;
 mod client;
 mod common;
@@ -11,6 +12,7 @@ mod types;
 mod whatsapp;
 
 use anyhow::{Context, Result, bail};
+use backend::{Backend, STORES, and_list, store};
 use client::Endpoint;
 use common::{
     Filter, MAX_CONTEXT, SCAN_LIMIT, e164, is_contact, keep_conversation, limit,
@@ -34,21 +36,34 @@ use types::{
     Unavailable,
 };
 
+/// "imessage, whatsapp or signal".
+fn source_names(sources: &[Source], last: &str) -> String {
+    and_list(
+        &sources.iter().map(Source::to_string).collect::<Vec<_>>(),
+        last,
+    )
+}
+
 /// Parse a source-qualified ID such as `imessage:2771`, `whatsapp:45` or `signal:<uuid>`
-/// into its source and backend-local ID. iMessage and WhatsApp IDs are integers; Signal
-/// conversation IDs are UUIDs and its message IDs integers.
+/// into its source and backend-local ID. Message IDs are integers in every store;
+/// conversation IDs are integers except where the store says otherwise.
 fn parse_id(id: &str) -> Result<(Source, String)> {
     id.split_once(':')
         .and_then(|(p, local)| {
             let source = Source::parse(p)?;
-            let valid = match source {
-                Source::Signal => !local.is_empty() && !local.contains(char::is_whitespace),
-                _ => local.parse::<i64>().is_ok(),
+            let valid = if store(source).numeric_ids {
+                local.parse::<i64>().is_ok()
+            } else {
+                !local.is_empty() && !local.contains(char::is_whitespace)
             };
             valid.then(|| (source, local.to_owned()))
         })
         .with_context(|| {
-            format!("Invalid ID {id:?}; IDs look like imessage:123, whatsapp:45 or signal:<uuid>")
+            let examples: Vec<_> = STORES.iter().map(|s| s.example_id).collect();
+            format!(
+                "Invalid ID {id:?}; IDs look like {}",
+                and_list(&examples, "or")
+            )
         })
 }
 
@@ -59,17 +74,36 @@ fn parse_cursor(cursor: &str) -> Result<(Source, Option<String>)> {
     Ok((source, Some(rest.to_owned()).filter(|r| !r.is_empty())))
 }
 
-#[derive(Clone)]
-struct Paths {
-    messages: PathBuf,
+/// What a service reads: Contacts, for names and send_message, and the stores it was
+/// started with.
+struct Stores {
     contacts: PathBuf,
-    whatsapp: PathBuf,
-    signal: PathBuf,
+    /// In `Source` order.
+    enabled: Vec<(Source, Box<dyn Backend>)>,
+}
+
+impl Stores {
+    fn sources(&self) -> Vec<Source> {
+        self.enabled.iter().map(|(s, _)| *s).collect()
+    }
+
+    fn get(&self, source: Source) -> Result<&dyn Backend> {
+        self.enabled
+            .iter()
+            .find(|(s, _)| *s == source)
+            .map(|(_, b)| b.as_ref())
+            .with_context(|| {
+                format!(
+                    "{source} is not enabled on this Mac; this service reads {}",
+                    source_names(&self.sources(), "and")
+                )
+            })
+    }
 }
 
 #[derive(Clone)]
 struct Server {
-    paths: Arc<Paths>,
+    stores: Arc<Stores>,
     tool_router: Arc<ToolRouter<Server>>,
     /// Socket connections: the process on the other end. Gateway requests carry their
     /// caller in the HTTP request instead.
@@ -166,20 +200,26 @@ struct SendRequest {
 /// Decide which backends to query. Explicit requests surface backend errors; the default
 /// "all sources" mode reports an unreadable store in `unavailable_sources` and continues.
 fn plan(
+    stores: &Stores,
     source: Option<Source>,
     conversation: Option<&str>,
 ) -> Result<(Vec<Source>, Option<String>, bool)> {
-    match (conversation.map(parse_id).transpose()?, source) {
+    let (sources, conversation, explicit) = match (conversation.map(parse_id).transpose()?, source)
+    {
         (Some((s, _)), Some(requested)) if s != requested => {
             bail!(
                 "source {requested} does not match conversation_id {}",
                 conversation.unwrap_or_default()
             )
         }
-        (Some((s, id)), _) => Ok((vec![s], Some(id), true)),
-        (None, Some(s)) => Ok((vec![s], None, true)),
-        (None, None) => Ok((ALL_SOURCES.to_vec(), None, false)),
+        (Some((s, id)), _) => (vec![s], Some(id), true),
+        (None, Some(s)) => (vec![s], None, true),
+        (None, None) => (stores.sources(), None, false),
+    };
+    for source in &sources {
+        stores.get(*source)?;
     }
+    Ok((sources, conversation, explicit))
 }
 
 /// Where pagination starts: the cursor's source position and its backend-local cursor.
@@ -231,25 +271,6 @@ fn parse_list_cursor(cursor: &str) -> Result<ListKey> {
     Ok((std::cmp::Reverse(time), source, id.len(), id.to_owned()))
 }
 
-impl Paths {
-    /// Cheap readability probe used before skipping a source in "all sources" mode.
-    fn check(&self, source: Source) -> Result<()> {
-        let path = match source {
-            Source::Imessage => self.messages.clone(),
-            Source::Whatsapp => self.whatsapp.join("ChatStorage.sqlite"),
-            Source::Signal => {
-                signal::open(&self.signal)?;
-                return Ok(());
-            }
-        };
-        if !path.exists() {
-            bail!("{} not found", path.display())
-        }
-        common::open(&path)?.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
-        Ok(())
-    }
-}
-
 fn none_readable(missing: &[Unavailable]) -> anyhow::Error {
     anyhow::anyhow!(
         "No message store is readable: {}",
@@ -278,14 +299,15 @@ fn output_schema<T: JsonSchema>() -> Arc<JsonObject> {
 }
 
 impl Server {
-    /// `send` false leaves send_message out of tools/list and refuses calls to it.
-    fn new(paths: Paths, send: bool) -> Self {
+    /// send_message is offered only with `send` and iMessage enabled; otherwise it is left
+    /// out of tools/list and calls to it are refused.
+    fn new(stores: Stores, send: bool) -> Self {
         let mut tool_router = Self::tool_router();
-        if !send {
+        if !send || stores.get(Source::Imessage).is_err() {
             tool_router.remove_route("send_message");
         }
         Self {
-            paths: Arc::new(paths),
+            stores: Arc::new(stores),
             tool_router: Arc::new(tool_router),
             caller: None,
         }
@@ -315,12 +337,12 @@ impl Server {
         job: F,
     ) -> Result<Json<T>, String>
     where
-        F: FnOnce(&Paths) -> Result<T> + Send + 'static,
+        F: FnOnce(&Stores) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let paths = self.paths.clone();
+        let stores = self.stores.clone();
         let started = std::time::Instant::now();
-        let result = match tokio::task::spawn_blocking(move || job(&paths)).await {
+        let result = match tokio::task::spawn_blocking(move || job(&stores)).await {
             Ok(Ok(value)) => Ok(Json(value)),
             Ok(Err(err)) => Err(format!("{err:#}")),
             Err(_) => Err("Server task failed".to_owned()),
@@ -356,10 +378,10 @@ impl Server {
         Parameters(p): Parameters<SendRequest>,
         extensions: Extensions,
     ) -> Result<Json<SendReceipt>, String> {
-        self.run("send_message", audit_arguments(&p), &extensions, move |paths| {
+        self.run("send_message", audit_arguments(&p), &extensions, move |stores| {
             // Only people the user saved in Contacts: an unknown number may be a stranger
             // steering an agent through the messages it reads.
-            let (contacts, readable) = load_contacts(&paths.contacts);
+            let (contacts, readable) = load_contacts(&stores.contacts);
             if readable == 0 {
                 bail!("Contacts could not be read, so the recipient can't be checked. Nothing was sent.")
             }
@@ -394,9 +416,9 @@ impl Server {
             "list_conversations",
             audit_arguments(&p),
             &extensions,
-            move |paths| {
+            move |stores| {
                 let cap = limit(p.limit)?;
-                let (order, _, explicit) = plan(p.source, None)?;
+                let (order, _, explicit) = plan(stores, p.source, None)?;
                 let after = p.cursor.as_deref().map(parse_list_cursor).transpose()?;
                 let active_after = parse_time(p.active_after.as_deref())?;
                 let query = p.query.as_deref().unwrap_or("").to_lowercase();
@@ -406,27 +428,18 @@ impl Server {
                 if !unread_only && (p.include_archived.is_some() || p.include_filtered.is_some()) {
                     bail!("include_archived and include_filtered require unread_only")
                 }
-                let (contacts, readable) = load_contacts(&paths.contacts);
+                let (contacts, readable) = load_contacts(&stores.contacts);
                 let (mut items, mut missing) = (Vec::new(), Vec::new());
                 for source in order.iter().copied() {
-                    if !explicit && let Err(error) = paths.check(source) {
+                    let backend = stores.get(source)?;
+                    if !explicit && let Err(error) = backend.check() {
                         missing.push(Unavailable {
                             source,
                             error: format!("{error:#}"),
                         });
                         continue;
                     }
-                    let listed = match source {
-                        Source::Imessage => {
-                            imessage::conversations(&paths.messages, &contacts, active_after)?
-                        }
-                        Source::Whatsapp => {
-                            whatsapp::conversations(&paths.whatsapp, &contacts, active_after)?
-                        }
-                        Source::Signal => {
-                            signal::conversations(&paths.signal, &contacts, active_after)?
-                        }
-                    };
+                    let listed = backend.conversations(&contacts, active_after)?;
                     for mut item in listed {
                         let key = list_key(item.latest, source, &item.id);
                         if after.as_ref().is_none_or(|a| &key > a)
@@ -500,29 +513,38 @@ impl Server {
             "search_contacts",
             audit_arguments(&p),
             &extensions,
-            move |paths| {
+            move |stores| {
                 let cap = limit(p.limit)?;
                 if p.query.trim().is_empty() {
                     bail!("query is required and must not be empty")
                 }
-                let (records, readable) = load_contact_records(&paths.contacts);
-                let (whatsapp, missing) = match whatsapp::address_book(&paths.whatsapp) {
-                    Ok(entries) => (entries, Vec::new()),
-                    Err(error) => (
-                        Vec::new(),
-                        vec![Unavailable {
-                            source: Source::Whatsapp,
+                let (records, readable) = load_contact_records(&stores.contacts);
+                // The enabled stores' own address books; today only WhatsApp has one.
+                let (mut books, mut missing, mut books_read) = (Vec::new(), Vec::new(), 0);
+                for (source, backend) in &stores.enabled {
+                    match backend.address_book() {
+                        Some(Ok(entries)) => {
+                            books.extend(entries);
+                            books_read += 1;
+                        }
+                        Some(Err(error)) => missing.push(Unavailable {
+                            source: *source,
                             error: format!("{error:#}"),
-                        }],
-                    ),
-                };
-                if readable == 0 && !missing.is_empty() {
-                    bail!(
-                        "Neither macOS Contacts nor WhatsApp's address book could be read: {}",
-                        missing[0].error
-                    )
+                        }),
+                        None => {}
+                    }
                 }
-                let (contacts, complete) = contacts::search(records, whatsapp, &p.query, cap);
+                if readable == 0 && books_read == 0 {
+                    match missing.first() {
+                        Some(m) => bail!(
+                            "Neither macOS Contacts nor the {} address book could be read: {}",
+                            m.source,
+                            m.error
+                        ),
+                        None => bail!("macOS Contacts could not be read"),
+                    }
+                }
+                let (contacts, complete) = contacts::search(records, books, &p.query, cap);
                 Ok(ContactList {
                     contacts,
                     complete,
@@ -547,7 +569,7 @@ impl Server {
             "get_message_context",
             audit_arguments(&p),
             &extensions,
-            move |paths| {
+            move |stores| {
                 let before = p.before.unwrap_or(5);
                 let after = p.after.unwrap_or(5);
                 if before > MAX_CONTEXT || after > MAX_CONTEXT {
@@ -558,34 +580,10 @@ impl Server {
                 if source != message_source {
                     bail!("message_id and conversation_id must come from the same source")
                 }
+                let backend = stores.get(source)?;
                 let message = number(&message).context("Message not found in conversation")?;
-                let (contacts, readable) = load_contacts(&paths.contacts);
-                let messages = match source {
-                    Source::Imessage => imessage::context(
-                        &paths.messages,
-                        &contacts,
-                        number(&conversation)?,
-                        message,
-                        before,
-                        after,
-                    )?,
-                    Source::Whatsapp => whatsapp::context(
-                        &paths.whatsapp,
-                        &contacts,
-                        number(&conversation)?,
-                        message,
-                        before,
-                        after,
-                    )?,
-                    Source::Signal => signal::context(
-                        &paths.signal,
-                        &contacts,
-                        &conversation,
-                        message,
-                        before,
-                        after,
-                    )?,
-                };
+                let (contacts, readable) = load_contacts(&stores.contacts);
+                let messages = backend.context(&contacts, &conversation, message, before, after)?;
                 Ok(MessageContext {
                     messages,
                     contacts_databases_read: readable,
@@ -607,7 +605,7 @@ impl Server {
         } else {
             "read_conversation"
         };
-        self.run(tool, audit_arguments(&p), extensions, move |paths| {
+        self.run(tool, audit_arguments(&p), extensions, move |stores| {
             let cap = limit(p.limit)?;
             if search && p.text.as_deref().is_none_or(|t| t.trim().is_empty()) {
                 bail!("text is required and must not be empty")
@@ -615,7 +613,8 @@ impl Server {
             if !search && p.conversation_id.is_none() {
                 bail!("conversation_id is required")
             }
-            let (order, conversation, explicit) = plan(p.source, p.conversation_id.as_deref())?;
+            let (order, conversation, explicit) =
+                plan(stores, p.source, p.conversation_id.as_deref())?;
             let filter = Filter {
                 conversation,
                 after: parse_time(p.after.as_deref())?,
@@ -628,7 +627,7 @@ impl Server {
                 bail!("after must be earlier than before")
             }
             let (first, local) = start(&order, p.cursor.as_deref())?;
-            let (contacts, readable) = load_contacts(&paths.contacts);
+            let (contacts, readable) = load_contacts(&stores.contacts);
             let (mut items, mut scanned, mut failures) = (Vec::new(), 0, 0);
             let (mut next, mut missing) = (None, Vec::new());
             for (index, source) in order.iter().copied().enumerate().skip(first) {
@@ -637,7 +636,8 @@ impl Server {
                     next = Some(format!("{source}:{}", cursor.unwrap_or_default()));
                     break;
                 }
-                if !explicit && let Err(error) = paths.check(source) {
+                let backend = stores.get(source)?;
+                if !explicit && let Err(error) = backend.check() {
                     missing.push(Unavailable {
                         source,
                         error: format!("{error:#}"),
@@ -645,32 +645,7 @@ impl Server {
                     continue;
                 }
                 let (left, budget) = (cap - items.len(), SCAN_LIMIT - scanned);
-                let page = match source {
-                    Source::Imessage => imessage::messages(
-                        &paths.messages,
-                        &contacts,
-                        &filter,
-                        cursor.as_deref(),
-                        left,
-                        budget,
-                    )?,
-                    Source::Whatsapp => whatsapp::messages(
-                        &paths.whatsapp,
-                        &contacts,
-                        &filter,
-                        cursor.as_deref(),
-                        left,
-                        budget,
-                    )?,
-                    Source::Signal => signal::messages(
-                        &paths.signal,
-                        &contacts,
-                        &filter,
-                        cursor.as_deref(),
-                        left,
-                        budget,
-                    )?,
-                };
+                let page = backend.messages(&contacts, &filter, cursor.as_deref(), left, budget)?;
                 items.extend(page.items);
                 scanned += page.scanned;
                 failures += page.decode_failures;
@@ -695,7 +670,7 @@ impl Server {
         .await
     }
 }
-const INSTRUCTIONS: &str = "Search and read the user’s iMessage, SMS, WhatsApp and Signal history on this Mac. To find messages by person, first call list_conversations with their name; for unread conversations, call list_conversations with unread_only; for recent activity, call list_conversations with active_after, then read_conversation with order newest_first and a small limit; a person can have an imessage:, a whatsapp: and a signal: conversation. IDs are source-qualified strings such as imessage:2771, whatsapp:45 or signal:<uuid>.";
+const INSTRUCTIONS: &str = "To find messages by person, first call list_conversations with their name; for unread conversations, call list_conversations with unread_only; for recent activity, call list_conversations with active_after, then read_conversation with order newest_first and a small limit";
 const SEND_INSTRUCTIONS: &str = " Send messages (iMessage only) only when the user asks. Sending returns submission, not delivery confirmation; never retry automatically.";
 const COMMON_INSTRUCTIONS: &str = " Follow continuation cursors with the same filters. Times use RFC 3339. Phone numbers are E.164 in results and match in any format in arguments. Contact names are optional. To look up a person's numbers and addresses, call search_contacts.";
 
@@ -707,9 +682,39 @@ impl ServerHandler for Server {
         } else {
             ""
         };
+        // Name only the stores this service reads.
+        let enabled: Vec<_> = self.stores.sources().into_iter().map(store).collect();
+        let names: Vec<_> = enabled.iter().flat_map(|s| s.names.iter()).collect();
+        let mut text = format!(
+            "Search and read the user’s {} history on this Mac. {INSTRUCTIONS}",
+            and_list(&names, "and")
+        );
+        if enabled.len() > 1 {
+            let prefixes: Vec<_> = enabled
+                .iter()
+                .map(|s| {
+                    let prefix = s.source.to_string();
+                    let article = if prefix.starts_with(['a', 'e', 'i', 'o', 'u']) {
+                        "an"
+                    } else {
+                        "a"
+                    };
+                    format!("{article} {prefix}:")
+                })
+                .collect();
+            text += &format!(
+                "; a person can have {} conversation",
+                and_list(&prefixes, "and")
+            );
+        }
+        let examples: Vec<_> = enabled.iter().map(|s| s.example_id).collect();
+        text += &format!(
+            ". IDs are source-qualified strings such as {}.",
+            and_list(&examples, "or")
+        );
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("msgmcp", env!("CARGO_PKG_VERSION")))
-            .with_instructions(format!("{INSTRUCTIONS}{send}{COMMON_INSTRUCTIONS}"))
+            .with_instructions(format!("{text}{send}{COMMON_INSTRUCTIONS}"))
     }
 }
 const AUTOMATION_CHECK_SCRIPT: &str = r#"with timeout of 10 seconds
@@ -724,9 +729,12 @@ msgmcp gateway [--listen ADDRESS] [--allow-host HOST]... [--allow-send] [--token
     MCP over Streamable HTTP at /mcp, with a bearer token; default address 127.0.0.1:8765.
     send_message is offered only with --allow-send. --allow-host accepts another Host
     name, such as a tailnet name. The token file is created on first start.
-STORES: [--database PATH] [--contacts DIRECTORY] [--whatsapp DIRECTORY] [--signal DIRECTORY]
+STORES: --source NAME... [--contacts DIRECTORY] {store_options}
+    Each --source enables one store ({store_names}); only enabled stores are read, and
+    at least one is required. A store's path option replaces its default location.
 Both services append every tool call and rejected request to the audit log, by default
-~/Library/Logs/msgmcp/audit.log. send_message only sends to addresses saved in Contacts.
+~/Library/Logs/msgmcp/audit.log. send_message needs --source imessage and only sends to
+addresses saved in Contacts.
 
 Clients (they open no database; ENDPOINT is --socket PATH or --url URL [--token-file PATH]):
 msgmcp [ENDPOINT]                     MCP stdio adapter (what MCP clients run)
@@ -740,6 +748,16 @@ msgmcp --check-signal [--signal DIRECTORY]
                                       read Signal's database key from the Keychain, asking the
                                       first time (choose Always Allow), and print counts only.
                                       The services never ask, so run this once from the app.";
+
+fn usage() -> String {
+    let options: Vec<_> = STORES
+        .iter()
+        .map(|s| format!("[{} {}]", s.option, s.value))
+        .collect();
+    USAGE
+        .replace("{store_options}", &options.join(" "))
+        .replace("{store_names}", &source_names(&ALL_SOURCES, "or"))
+}
 
 enum Mode {
     Adapter,
@@ -777,12 +795,9 @@ fn check_automation() -> Result<()> {
 async fn main() -> Result<()> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
     let state = home.join("Library/Application Support/MSGMCP");
-    let mut paths = Paths {
-        messages: home.join("Library/Messages/chat.db"),
-        contacts: home.join("Library/Application Support/AddressBook"),
-        whatsapp: home.join("Library/Group Containers/group.net.whatsapp.WhatsApp.shared"),
-        signal: home.join("Library/Application Support/Signal"),
-    };
+    let mut contacts = home.join("Library/Application Support/AddressBook");
+    // Enabled stores, and the path options given for any store.
+    let (mut sources, mut store_paths) = (Vec::new(), Vec::new());
     let default_socket = state.join("run/service.sock");
     let mut audit_log = home.join("Library/Logs/msgmcp/audit.log");
     let (mut socket, mut url, mut token_file) = (None, None, state.join("gateway.token"));
@@ -794,6 +809,11 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
+        if let Some(found) = STORES.iter().find(|s| s.option == arg) {
+            store_paths.push((found, PathBuf::from(value()?)));
+            store_option = Some(arg);
+            continue;
+        }
         match arg.as_str() {
             "socket" if matches!(mode, Mode::Adapter) => mode = Mode::Socket,
             "gateway" if matches!(mode, Mode::Adapter) => mode = Mode::Gateway,
@@ -809,24 +829,31 @@ async fn main() -> Result<()> {
             "--socket" => socket = Some(PathBuf::from(value()?)),
             "--url" => url = Some(value()?),
             "--token-file" => token_file = PathBuf::from(value()?),
-            "--database" => paths.messages = PathBuf::from(value()?),
-            "--contacts" => paths.contacts = PathBuf::from(value()?),
-            "--whatsapp" => paths.whatsapp = PathBuf::from(value()?),
-            "--signal" => paths.signal = PathBuf::from(value()?),
+            "--source" => {
+                let name = value()?;
+                let source = Source::parse(&name).with_context(|| {
+                    format!(
+                        "Unknown source {name:?}; sources are {}",
+                        source_names(&ALL_SOURCES, "and")
+                    )
+                })?;
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
+            }
+            "--contacts" => contacts = PathBuf::from(value()?),
             "--audit-log" => audit_log = PathBuf::from(value()?),
             "--listen" => listen = value()?,
             "--allow-host" => allowed_hosts.push(value()?),
             "--allow-send" => allow_send = true,
             "--help" | "-h" | "help" => {
-                eprintln!("{USAGE}");
+                eprintln!("{}", usage());
                 return Ok(());
             }
-            _ => bail!("Unexpected argument: {arg}\n{USAGE}"),
+            _ => bail!("Unexpected argument: {arg}\n{}", usage()),
         }
         match arg.as_str() {
-            "--database" | "--contacts" | "--whatsapp" | "--signal" | "--audit-log" => {
-                store_option = Some(arg)
-            }
+            "--source" | "--contacts" | "--audit-log" => store_option = Some(arg),
             "--listen" | "--allow-host" | "--allow-send" => gateway_option = Some(arg),
             _ => {}
         }
@@ -843,9 +870,42 @@ async fn main() -> Result<()> {
     if socket.is_some() && matches!(mode, Mode::Gateway) {
         bail!("--socket is for the socket service and clients");
     }
+    let path = |source: Source| {
+        let found = store(source);
+        store_paths
+            .iter()
+            .rev()
+            .find(|(s, _)| s.source == source)
+            .map_or_else(|| home.join(found.default_path), |(_, p)| p.clone())
+    };
+    if matches!(mode, Mode::Socket | Mode::Gateway) {
+        if sources.is_empty() {
+            bail!(
+                "Choose the message stores to serve with --source, once for each of {}",
+                source_names(&ALL_SOURCES, "or")
+            );
+        }
+        if let Some((found, _)) = store_paths
+            .iter()
+            .find(|(s, _)| !sources.contains(&s.source))
+        {
+            bail!("{} requires --source {}", found.option, found.source);
+        }
+        if allow_send && !sources.contains(&Source::Imessage) {
+            bail!("--allow-send requires --source imessage; only iMessage can send");
+        }
+        sources.sort();
+    }
+    let stores = || Stores {
+        contacts: contacts.clone(),
+        enabled: sources
+            .iter()
+            .map(|&source| (source, (store(source).open)(path(source))))
+            .collect(),
+    };
     match mode {
         Mode::CheckSignal => {
-            let (conversations, messages) = signal::counts(&paths.signal)?;
+            let (conversations, messages) = signal::counts(&path(Source::Signal))?;
             println!("Signal access succeeded; {conversations} conversations, {messages} messages");
             Ok(())
         }
@@ -853,7 +913,7 @@ async fn main() -> Result<()> {
             let _prompts = signal::disable_keychain_prompts()?;
             audit::init(audit_log, "socket")?;
             let socket = socket.unwrap_or(default_socket);
-            socket::serve(Server::new(paths, true), socket).await
+            socket::serve(Server::new(stores(), true), socket).await
         }
         Mode::Gateway => {
             let _prompts = signal::disable_keychain_prompts()?;
@@ -863,7 +923,7 @@ async fn main() -> Result<()> {
                 token_file,
                 allowed_hosts,
             };
-            gateway::serve(Server::new(paths, allow_send), options).await
+            gateway::serve(Server::new(stores(), allow_send), options).await
         }
         client => {
             if socket.is_some() && url.is_some() {

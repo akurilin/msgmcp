@@ -12,16 +12,63 @@
 //! - `message_attachments`: files, stickers and contact cards, one row per attachment;
 //!   `editHistoryIndex` -1 belongs to the message itself rather than an earlier edit.
 //! - `items`: key-value settings, including the user's own account ID.
-use crate::common::{Contacts, Filter, Listed, Page, contact_name, display_address};
+use crate::backend::Backend;
+use crate::common::{
+    Contacts, Filter, Listed, Page, contact_name, display_address, neighbors, page,
+};
 use crate::types::{ChatType, Conversation, Kind, Message, Person, Reaction, Source, TextStatus};
 use anyhow::{Context, Result, bail};
 use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 use serde_json::Value;
-use std::{collections::HashMap, path::Path, sync::Mutex};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 pub const PREFIX: &str = "signal";
+
+/// Signal Desktop's Application Support folder.
+struct Signal(PathBuf);
+
+pub fn backend(dir: PathBuf) -> Box<dyn Backend> {
+    Box::new(Signal(dir))
+}
+
+impl Backend for Signal {
+    fn check(&self) -> Result<()> {
+        open(&self.0).map(drop)
+    }
+    fn conversations(
+        &self,
+        contacts: &Contacts,
+        active_after: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Listed>> {
+        conversations(&self.0, contacts, active_after)
+    }
+    fn messages(
+        &self,
+        contacts: &Contacts,
+        filter: &Filter,
+        cursor: Option<&str>,
+        cap: usize,
+        budget: usize,
+    ) -> Result<Page> {
+        messages(&self.0, contacts, filter, cursor, cap, budget)
+    }
+    fn context(
+        &self,
+        contacts: &Contacts,
+        conversation: &str,
+        message: i64,
+        before: usize,
+        after: usize,
+    ) -> Result<Vec<Message>> {
+        context(&self.0, contacts, conversation, message, (before, after))
+    }
+}
 const DATABASE: &str = "sql/db.sqlite";
 const KEYCHAIN_SERVICE: &str = "Signal Safe Storage";
 
@@ -430,7 +477,7 @@ fn ensure_conversation(db: &Connection, id: &str) -> Result<()> {
 
 /// Every conversation the user has used (Signal also keeps one for each contact it has
 /// heard of) whose newest message is at or after `active_after`.
-pub fn conversations(
+fn conversations(
     dir: &Path,
     contacts: &Contacts,
     active_after: Option<DateTime<Utc>>,
@@ -496,7 +543,7 @@ pub fn conversations(
     Ok(items)
 }
 
-pub fn messages(
+fn messages(
     dir: &Path,
     contacts: &Contacts,
     filter: &Filter,
@@ -527,35 +574,22 @@ pub fn messages(
         cursor.1,
         (budget + 1) as i64
     ])?;
-    let mut page = Page {
-        items: Vec::new(),
-        scanned: 0,
-        decode_failures: 0,
-        next: None,
-    };
-    let mut last = cursor;
-    while let Some(row) = rows.next()? {
-        if page.scanned == budget || page.items.len() == cap {
-            page.next = Some(format!("{}:{}", last.0, last.1));
-            break;
-        }
-        page.scanned += 1;
-        let (item, key) = message(row, &directory, contacts)?;
-        last = key;
-        if filter.matches(&item) {
-            page.items.push(item);
-        }
-    }
-    Ok(page)
+    page(
+        &mut rows,
+        filter,
+        cursor,
+        (cap, budget),
+        |row| message(row, &directory, contacts),
+        |(sent, id)| format!("{sent}:{id}"),
+    )
 }
 
-pub fn context(
+fn context(
     dir: &Path,
     contacts: &Contacts,
     conversation: &str,
     message_id: i64,
-    before: usize,
-    after: usize,
+    around: (usize, usize),
 ) -> Result<Vec<Message>> {
     let db = open(dir)?;
     let sent: i64 = db
@@ -566,23 +600,18 @@ pub fn context(
         )
         .context("Message not found in conversation")?;
     let directory = Directory::load(&db)?;
-    let mut values = Vec::new();
-    for (op, order, count) in [("<", "DESC", before), (">=", "ASC", after + 1)] {
-        let sql = format!(
-            "{MESSAGE_SELECT} WHERE m.conversationId=? AND {MESSAGE_FILTER} AND (m.sent_at,m.rowid) {op} (?,?) ORDER BY m.sent_at {order},m.rowid {order} LIMIT ?"
-        );
-        let mut stmt = db.prepare(&sql)?;
-        let mut part = stmt
-            .query_map(params![conversation, sent, message_id, count as i64], |r| {
-                message(r, &directory, contacts)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if op == "<" {
-            part.reverse();
-        }
-        values.extend(part.into_iter().map(|x| x.0));
-    }
-    Ok(values)
+    neighbors(
+        &db,
+        conversation,
+        (sent, message_id),
+        around,
+        |op, order| {
+            format!(
+                "{MESSAGE_SELECT} WHERE m.conversationId=? AND {MESSAGE_FILTER} AND (m.sent_at,m.rowid) {op} (?,?) ORDER BY m.sent_at {order},m.rowid {order} LIMIT ?"
+            )
+        },
+        |r| message(r, &directory, contacts).map(|x| x.0),
+    )
 }
 
 #[cfg(test)]

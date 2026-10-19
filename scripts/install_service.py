@@ -20,6 +20,17 @@ SERVICES = ('gateway', 'socket')
 GATEWAY_ADDRESS = ('127.0.0.1', 8765)
 SOCKET = STATE / 'run/service.sock'
 TOKEN = STATE / 'gateway.token'
+# The message stores a service can read (`msgmcp --help`), each enabled with --source, and
+# where each keeps its data on this Mac.
+SOURCES = {
+    'imessage': HOME / 'Library/Messages/chat.db',
+    'whatsapp': HOME / 'Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite',
+    'signal': HOME / 'Library/Application Support/Signal/sql/db.sqlite',
+}
+# Stores read only with Full Disk Access; Signal's folder isn't protected.
+FULL_DISK_ACCESS = ('imessage', 'whatsapp')
+# What a LaunchAgent from before --source read.
+LEGACY_SOURCES = ['imessage', 'whatsapp']
 
 
 def run(*args, check=True):
@@ -47,12 +58,42 @@ def uninstall():
     print('MSGMCP app and login service removed. Logs retained.')
 
 
-def service_command(service='gateway', allowed_hosts=(), allow_send=False):
+def detected_sources():
+    """The stores whose data is on this Mac. Messages keeps chat.db behind Full Disk
+    Access, so a shell may not see it; it is always offered."""
+    return [name for name, path in SOURCES.items() if name == 'imessage' or path.exists()]
+
+
+def service_command(service='gateway', allowed_hosts=(), allow_send=False, sources=()):
     """The msgmcp arguments the LaunchAgent runs."""
     if (allowed_hosts or allow_send) and service != 'gateway':
         raise SystemExit('--allow-host and --allow-send apply only to the gateway')
+    if not sources:
+        raise SystemExit('Choose the stores to serve with --source: ' + ', '.join(SOURCES))
+    if allow_send and 'imessage' not in sources:
+        raise SystemExit('--allow-send requires --source imessage; only iMessage can send')
     hosts = [arg for host in allowed_hosts for arg in ('--allow-host', host)]
-    return [service] + hosts + (['--allow-send'] if allow_send else [])
+    chosen = [arg for name in SOURCES if name in sources for arg in ('--source', name)]
+    return [service] + chosen + hosts + (['--allow-send'] if allow_send else [])
+
+
+def command_sources(command):
+    """The --source values of a service command."""
+    return [command[i + 1] for i, arg in enumerate(command[:-1]) if arg == '--source']
+
+
+def with_sources(command, sources):
+    """`command` serving `sources` instead of its own."""
+    rest = [arg for i, arg in enumerate(command)
+            if arg != '--source' and (i == 0 or command[i - 1] != '--source')]
+    return service_command(rest[0], [rest[i + 1] for i, a in enumerate(rest[:-1]) if a == '--allow-host'],
+                           '--allow-send' in rest, sources)
+
+
+def installed_sources():
+    """The stores the installed LaunchAgent serves, or None."""
+    command = installed_command()
+    return None if command is None else command_sources(command) or LEGACY_SOURCES
 
 
 def installed_command():
@@ -120,10 +161,12 @@ if __name__ == '__main__':
                         help='extra Host name the gateway accepts, such as a tailnet name; repeatable')
     parser.add_argument('--allow-send', action='store_true',
                         help='let gateway clients use send_message (Contacts recipients only)')
+    parser.add_argument('--source', action='append', choices=SOURCES, default=[],
+                        help='a message store to serve; repeatable, at least one')
     args = parser.parse_args()
     check_paths()
     if args.uninstall:
         uninstall()
     else:
         install(args.binary.resolve(), args.sign,
-                service_command(args.service, args.allow_host, args.allow_send))
+                service_command(args.service, args.allow_host, args.allow_send, args.source))

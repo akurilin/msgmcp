@@ -1,8 +1,8 @@
 //! Helpers shared by the message store backends.
-use crate::types::{Conversation, Message, Person};
+use crate::types::{Conversation, Message, Person, TextStatus};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, ToSql, params};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -30,6 +30,15 @@ pub fn open(path: &Path) -> Result<Connection> {
         })?;
     db.busy_timeout(Duration::from_secs(SQLITE_TIMEOUT_SECONDS))?;
     Ok(db)
+}
+
+/// Open an SQLite store and read its schema: `Backend::check` for plain SQLite stores.
+pub fn probe(path: &Path) -> Result<()> {
+    if !path.exists() {
+        bail!("{} not found", path.display())
+    }
+    open(path)?.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
+    Ok(())
 }
 
 fn digits(s: &str) -> String {
@@ -282,6 +291,69 @@ pub struct Page {
     pub decode_failures: usize,
     /// Backend-local continuation cursor; `None` when this backend is exhausted.
     pub next: Option<String>,
+}
+
+/// Read one page from `rows`, which come in cursor order, starting after the key `start`.
+/// The page stops at `budget` rows read or `cap` matches; its cursor is the key of the
+/// last row read.
+pub fn page<K: Copy>(
+    rows: &mut rusqlite::Rows<'_>,
+    filter: &Filter,
+    start: K,
+    (cap, budget): (usize, usize),
+    mut read: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<(Message, K)>,
+    cursor: impl Fn(K) -> String,
+) -> Result<Page> {
+    let mut page = Page {
+        items: Vec::new(),
+        scanned: 0,
+        decode_failures: 0,
+        next: None,
+    };
+    let mut last = start;
+    while let Some(row) = rows.next()? {
+        if page.scanned == budget || page.items.len() == cap {
+            page.next = Some(cursor(last));
+            break;
+        }
+        page.scanned += 1;
+        let (item, key) = read(row)?;
+        last = key;
+        if item.text_status == TextStatus::DecodeFailed {
+            page.decode_failures += 1;
+        }
+        if filter.matches(&item) {
+            page.items.push(item);
+        }
+    }
+    Ok(page)
+}
+
+/// get_message_context's two reads around the message whose key is (time, ID): `sql(op,
+/// order)` selects one conversation's messages compared with `op` and sorted by `order`,
+/// with the parameters (conversation, time, ID, limit).
+pub fn neighbors<C: ToSql, T: ToSql>(
+    db: &Connection,
+    conversation: C,
+    key: (T, i64),
+    (before, after): (usize, usize),
+    sql: impl Fn(&str, &str) -> String,
+    mut read: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<Message>,
+) -> Result<Vec<Message>> {
+    let mut values = Vec::new();
+    for (op, order, count) in [("<", "DESC", before), (">=", "ASC", after + 1)] {
+        let mut stmt = db.prepare(&sql(op, order))?;
+        let mut part = stmt
+            .query_map(params![conversation, key.0, key.1, count as i64], |r| {
+                read(r)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if op == "<" {
+            part.reverse();
+        }
+        values.extend(part);
+    }
+    Ok(values)
 }
 
 /// A conversation with what list_conversations sorts on.

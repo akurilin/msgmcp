@@ -1,15 +1,67 @@
 //! iMessage/SMS backend: `~/Library/Messages/chat.db` (read-only) and Messages automation.
-use crate::common::{APPLE_EPOCH, Contacts, Filter, Listed, Page, number, open, person};
+use crate::backend::Backend;
+use crate::common::{
+    APPLE_EPOCH, Contacts, Filter, Listed, Page, neighbors, number, open, page, person, probe,
+};
 use crate::types::{
     Conversation, Message, Person, SendReceipt, SendStatus, Service, Source, TextStatus,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
-use std::{path::Path, process::Command};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 pub const PREFIX: &str = "imessage";
+
+/// `chat.db`.
+struct Imessage(PathBuf);
+
+pub fn backend(path: PathBuf) -> Box<dyn Backend> {
+    Box::new(Imessage(path))
+}
+
+impl Backend for Imessage {
+    fn check(&self) -> Result<()> {
+        probe(&self.0)
+    }
+    fn conversations(
+        &self,
+        contacts: &Contacts,
+        active_after: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Listed>> {
+        conversations(&self.0, contacts, active_after)
+    }
+    fn messages(
+        &self,
+        contacts: &Contacts,
+        filter: &Filter,
+        cursor: Option<&str>,
+        cap: usize,
+        budget: usize,
+    ) -> Result<Page> {
+        messages(&self.0, contacts, filter, cursor, cap, budget)
+    }
+    fn context(
+        &self,
+        contacts: &Contacts,
+        conversation: &str,
+        message: i64,
+        before: usize,
+        after: usize,
+    ) -> Result<Vec<Message>> {
+        context(
+            &self.0,
+            contacts,
+            number(conversation)?,
+            message,
+            (before, after),
+        )
+    }
+}
 
 // Pass data as arguments so message text cannot become AppleScript code.
 const SEND_SCRIPT: &str = r#"on run argv
@@ -165,7 +217,7 @@ fn ensure_conversation(db: &Connection, id: i64) -> Result<()> {
 
 /// Every conversation whose newest real message is at or after `active_after`, with its
 /// unread incoming messages, matching what read_conversation returns.
-pub fn conversations(
+fn conversations(
     path: &Path,
     contacts: &Contacts,
     active_after: Option<DateTime<Utc>>,
@@ -206,7 +258,7 @@ pub fn conversations(
     Ok(items)
 }
 
-pub fn messages(
+fn messages(
     path: &Path,
     contacts: &Contacts,
     filter: &Filter,
@@ -239,38 +291,22 @@ pub fn messages(
         cursor.2,
         (budget + 1) as i64
     ])?;
-    let mut page = Page {
-        items: Vec::new(),
-        scanned: 0,
-        decode_failures: 0,
-        next: None,
-    };
-    let mut last = cursor;
-    while let Some(row) = rows.next()? {
-        if page.scanned == budget || page.items.len() == cap {
-            page.next = Some(format!("{}:{}:{}", last.0, last.1, last.2));
-            break;
-        }
-        page.scanned += 1;
-        let (item, key) = message(row, contacts)?;
-        last = key;
-        if item.text_status == TextStatus::DecodeFailed {
-            page.decode_failures += 1;
-        }
-        if filter.matches(&item) {
-            page.items.push(item);
-        }
-    }
-    Ok(page)
+    page(
+        &mut rows,
+        filter,
+        cursor,
+        (cap, budget),
+        |row| message(row, contacts),
+        |(date, id, chat)| format!("{date}:{id}:{chat}"),
+    )
 }
 
-pub fn context(
+fn context(
     path: &Path,
     contacts: &Contacts,
     conversation: i64,
     message_id: i64,
-    before: usize,
-    after: usize,
+    around: (usize, usize),
 ) -> Result<Vec<Message>> {
     let db = open(path)?;
     let date: i64 = db
@@ -280,21 +316,16 @@ pub fn context(
             |r| r.get(0),
         )
         .context("Message not found in conversation")?;
-    let mut values = Vec::new();
-    for (op, order, count) in [("<", "DESC", before), (">=", "ASC", after + 1)] {
-        let sql = format!(
-            "{MESSAGE_SELECT} WHERE cmj.chat_id=? AND {REAL_MESSAGE} AND (m.date,m.ROWID) {op} (?,?) ORDER BY m.date {order},m.ROWID {order} LIMIT ?"
-        );
-        let mut stmt = db.prepare(&sql)?;
-        let mut part = stmt
-            .query_map(params![conversation, date, message_id, count as i64], |r| {
-                message(r, contacts)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if op == "<" {
-            part.reverse();
-        }
-        values.extend(part.into_iter().map(|x| x.0));
-    }
-    Ok(values)
+    neighbors(
+        &db,
+        conversation,
+        (date, message_id),
+        around,
+        |op, order| {
+            format!(
+                "{MESSAGE_SELECT} WHERE cmj.chat_id=? AND {REAL_MESSAGE} AND (m.date,m.ROWID) {op} (?,?) ORDER BY m.date {order},m.ROWID {order} LIMIT ?"
+            )
+        },
+        |r| message(r, contacts).map(|x| x.0),
+    )
 }

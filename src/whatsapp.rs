@@ -5,17 +5,71 @@
 //!   group members, media items (captions, reply metadata) and receipt info (reactions).
 //! - `LID.sqlite` and `ContactsV2.sqlite`: optional; map opaque `@lid` identities to
 //!   phone numbers and WhatsApp's own contact names.
+use crate::backend::Backend;
 use crate::common::{
-    APPLE_EPOCH, Contacts, Filter, Listed, Page, contact_name, e164, number, open,
+    APPLE_EPOCH, Contacts, Filter, Listed, Page, contact_name, e164, neighbors, number, open, page,
+    probe,
 };
 use crate::types::{ChatType, Conversation, Kind, Message, Person, Reaction, Source, TextStatus};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 pub const PREFIX: &str = "whatsapp";
 const CHAT_STORAGE: &str = "ChatStorage.sqlite";
+
+/// WhatsApp's group container.
+struct Whatsapp(PathBuf);
+
+pub fn backend(dir: PathBuf) -> Box<dyn Backend> {
+    Box::new(Whatsapp(dir))
+}
+
+impl Backend for Whatsapp {
+    fn check(&self) -> Result<()> {
+        probe(&self.0.join(CHAT_STORAGE))
+    }
+    fn conversations(
+        &self,
+        contacts: &Contacts,
+        active_after: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Listed>> {
+        conversations(&self.0, contacts, active_after)
+    }
+    fn messages(
+        &self,
+        contacts: &Contacts,
+        filter: &Filter,
+        cursor: Option<&str>,
+        cap: usize,
+        budget: usize,
+    ) -> Result<Page> {
+        messages(&self.0, contacts, filter, cursor, cap, budget)
+    }
+    fn context(
+        &self,
+        contacts: &Contacts,
+        conversation: &str,
+        message: i64,
+        before: usize,
+        after: usize,
+    ) -> Result<Vec<Message>> {
+        context(
+            &self.0,
+            contacts,
+            number(conversation)?,
+            message,
+            (before, after),
+        )
+    }
+    fn address_book(&self) -> Option<Result<Vec<AddressBookEntry>>> {
+        Some(address_book(&self.0))
+    }
+}
 
 // ZSESSIONTYPE 0 direct, 1 group, 2 broadcast list, 4 community; 3 (status updates) is excluded.
 const SESSION_FILTER: &str = "s.ZSESSIONTYPE IN (0,1,2,4) AND COALESCE(s.ZREMOVED,0)=0 AND s.ZCONTACTJID NOT LIKE '%@status'";
@@ -43,7 +97,7 @@ pub struct AddressBookEntry {
 }
 
 /// WhatsApp's address book, from `ContactsV2.sqlite`.
-pub fn address_book(dir: &Path) -> Result<Vec<AddressBookEntry>> {
+fn address_book(dir: &Path) -> Result<Vec<AddressBookEntry>> {
     let path = dir.join("ContactsV2.sqlite");
     if !path.exists() {
         bail!("WhatsApp address book not found at {}", path.display())
@@ -476,7 +530,7 @@ fn ensure_conversation(db: &Connection, id: i64) -> Result<()> {
 /// message is computed from the messages themselves: ZLASTMESSAGEDATE is not a reliable
 /// time (pinned chats store a date far in the future) and counts excluded system rows.
 /// ZUNREADCOUNT is -1 for a chat the user marked unread.
-pub fn conversations(
+fn conversations(
     dir: &Path,
     contacts: &Contacts,
     active_after: Option<DateTime<Utc>>,
@@ -534,7 +588,7 @@ pub fn conversations(
     Ok(items)
 }
 
-pub fn messages(
+fn messages(
     dir: &Path,
     contacts: &Contacts,
     filter: &Filter,
@@ -566,35 +620,22 @@ pub fn messages(
         cursor.1,
         (budget + 1) as i64
     ])?;
-    let mut page = Page {
-        items: Vec::new(),
-        scanned: 0,
-        decode_failures: 0,
-        next: None,
-    };
-    let mut last = cursor;
-    while let Some(row) = rows.next()? {
-        if page.scanned == budget || page.items.len() == cap {
-            page.next = Some(format!("{}:{}", last.0, last.1));
-            break;
-        }
-        page.scanned += 1;
-        let (item, key) = message(row, &directory, contacts)?;
-        last = key;
-        if filter.matches(&item) {
-            page.items.push(item);
-        }
-    }
-    Ok(page)
+    page(
+        &mut rows,
+        filter,
+        cursor,
+        (cap, budget),
+        |row| message(row, &directory, contacts),
+        |(date, id)| format!("{date}:{id}"),
+    )
 }
 
-pub fn context(
+fn context(
     dir: &Path,
     contacts: &Contacts,
     conversation: i64,
     message_id: i64,
-    before: usize,
-    after: usize,
+    around: (usize, usize),
 ) -> Result<Vec<Message>> {
     let db = chat_storage(dir)?;
     let date: f64 = db
@@ -605,21 +646,16 @@ pub fn context(
         )
         .context("Message not found in conversation")?;
     let directory = Directory::load(dir, &db);
-    let mut values = Vec::new();
-    for (op, order, count) in [("<", "DESC", before), (">=", "ASC", after + 1)] {
-        let sql = format!(
-            "{MESSAGE_SELECT} WHERE m.ZCHATSESSION=? AND {MESSAGE_FILTER} AND (m.ZMESSAGEDATE,m.Z_PK) {op} (?,?) ORDER BY m.ZMESSAGEDATE {order},m.Z_PK {order} LIMIT ?"
-        );
-        let mut stmt = db.prepare(&sql)?;
-        let mut part = stmt
-            .query_map(params![conversation, date, message_id, count as i64], |r| {
-                message(r, &directory, contacts)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if op == "<" {
-            part.reverse();
-        }
-        values.extend(part.into_iter().map(|x| x.0));
-    }
-    Ok(values)
+    neighbors(
+        &db,
+        conversation,
+        (date, message_id),
+        around,
+        |op, order| {
+            format!(
+                "{MESSAGE_SELECT} WHERE m.ZCHATSESSION=? AND {MESSAGE_FILTER} AND (m.ZMESSAGEDATE,m.Z_PK) {op} (?,?) ORDER BY m.ZMESSAGEDATE {order},m.Z_PK {order} LIMIT ?"
+            )
+        },
+        |r| message(r, &directory, contacts).map(|x| x.0),
+    )
 }

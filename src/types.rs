@@ -1,6 +1,10 @@
 //! Typed tool inputs' shared enums and every tool result. Each result type's JSON schema is
 //! published as the tool's `outputSchema`, so the doc comments here are the reference for
 //! result fields; clients see them through `tools/list` or `msgmcp schema`.
+//!
+//! Enumerated result fields are plain strings in the schema, with their values listed in the
+//! field's description: a client that checks results against a schema it fetched earlier
+//! must not fail when a new store or kind of message adds a value.
 use crate::{imessage, signal, whatsapp};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -124,6 +128,8 @@ pub struct Reaction {
 /// excluded, and an edited Signal message has its latest text.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Message {
+    /// Message store: "imessage", "whatsapp" or "signal". Other stores may be added.
+    #[schemars(with = "String")]
     pub source: Source,
     /// Source-qualified message ID, e.g. "imessage:85544", "whatsapp:9120" or "signal:310".
     /// Pass it back exactly as returned.
@@ -142,14 +148,21 @@ pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_read: Option<bool>,
     pub sender: Person,
-    /// WhatsApp and Signal only.
+    /// WhatsApp and Signal only: "text", "link", "image", "video", "audio", "gif",
+    /// "sticker", "document", "contact", "location", "deleted" or "other". Other kinds may be
+    /// added.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
     pub kind: Option<Kind>,
     /// Message text. iMessage attachments are not read, so an attachment-only message is the
     /// object replacement character U+FFFC. WhatsApp media text is the caption or file name;
     /// Signal media text is the message body, or a document's file name; deleted messages
     /// have none.
     pub text: Option<String>,
+    /// "ok": `text` holds the message text. "no_text": the message has none, such as an
+    /// attachment without a caption or a deleted message. "decode_failed", iMessage only: the
+    /// stored attributed text could not be decoded. Other values may be added.
+    #[schemars(with = "String")]
     pub text_status: TextStatus,
     /// `guid` of the message this one replies to. iMessage uses the thread originator, which
     /// can be the thread root; WhatsApp and Signal use the quoted message.
@@ -165,6 +178,8 @@ pub struct Message {
 /// heard of).
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Conversation {
+    /// Message store: "imessage", "whatsapp" or "signal". Other stores may be added.
+    #[schemars(with = "String")]
     pub source: Source,
     /// Source-qualified conversation ID, e.g. "imessage:2771", "whatsapp:45" or
     /// "signal:<uuid>". Pass it back exactly as returned.
@@ -174,8 +189,10 @@ pub struct Conversation {
     pub identifier: Option<String>,
     /// Chat display name; empty or null for most direct chats.
     pub name: Option<String>,
-    /// WhatsApp and Signal only.
+    /// WhatsApp and Signal only: "direct", "group", or for WhatsApp "broadcast" or
+    /// "community". Other types may be added.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
     pub chat_type: Option<ChatType>,
     /// Other participants, at most 50. WhatsApp and Signal groups list current members only.
     pub participants: Vec<Person>,
@@ -210,6 +227,8 @@ fn is_false(value: &bool) -> bool {
 /// A message store skipped because it could not be read.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Unavailable {
+    /// Message store: "imessage", "whatsapp" or "signal". Other stores may be added.
+    #[schemars(with = "String")]
     pub source: Source,
     pub error: String,
 }
@@ -282,7 +301,11 @@ pub enum Service {
 /// Result of send_message.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SendReceipt {
+    /// "submitted": handed to the app. Delivery is not confirmed.
+    #[schemars(with = "String")]
     pub status: SendStatus,
+    /// "iMessage". Other services may be added.
+    #[schemars(with = "String")]
     pub service: Service,
     /// The recipient address as sent: a phone number in E.164, or the email address.
     pub recipient: String,
@@ -302,6 +325,10 @@ pub enum NameSource {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
 pub struct ContactName {
     pub name: String,
+    /// "contacts": macOS Contacts, as the user saved it. "whatsapp": WhatsApp's address
+    /// book, the name saved for this number on the user's phone as WhatsApp synced it, not
+    /// the person's own profile name. Other address books may be added.
+    #[schemars(with = "String")]
     pub source: NameSource,
 }
 

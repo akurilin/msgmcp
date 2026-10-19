@@ -31,7 +31,11 @@ Run them before every commit, and add a test for every behavior change.
   result doc comments in `types.rs` become what clients see in `tools/list`. Edit them as
   documentation.
 - **Keep API changes additive.** Agents in long-lived sandboxes may hold an old schema: add
-  optional fields and arguments, don't rename or remove.
+  optional fields and arguments, don't rename or remove. Enumerated result fields are
+  strings in the schema (`#[schemars(with = "String")]`), so a new value doesn't fail a
+  client that checks results against an older one.
+- **A new store is a module implementing `Backend` and an entry in `STORES`**
+  (`backend.rs`), plus its fixture in `smoke.py` and its path in `install_service.py`.
 - **Never send a real message in tests.** Send tests stop at validation (an unknown
   recipient, or empty text to a contact). `scripts/send_e2e.py` is the only real send and
   is run by hand, with the user's go-ahead.
@@ -42,8 +46,11 @@ Run them before every commit, and add a test for every behavior change.
 - **iMessage queries go through `REAL_MESSAGE`** in `imessage.rs`, which drops reactions and
   events (group changes and the like). WhatsApp and Signal have the equivalent
   `MESSAGE_FILTER`.
-- **Tests pass every store explicitly.** A service started without `--signal` reads the
-  real Signal folder; `stores()` in `smoke.py` passes all of them. Signal's fixture is
+- **Tests pass every store explicitly.** A service reads only the stores enabled with
+  `--source`, but an enabled store without its path option reads this Mac's real one.
+  `stores()` in `smoke.py` passes a fixture for each, and
+  `test_harness_passes_every_store_option` fails if a store is added to `backend.rs`
+  without one there. Signal's fixture is
   encrypted by `examples/sqlcipher_encrypt.rs`, which `smoke.py` builds, since Python's
   sqlite3 can't write SQLCipher.
 - **The services never show Keychain dialogs** (`disable_keychain_prompts`), so a remote
@@ -56,8 +63,8 @@ Run them before every commit, and add a test for every behavior change.
 ## Running a service by hand
 
 ```sh
-msgmcp socket --socket /tmp/x/service.sock --database /path/chat.db --contacts /path/AddressBook --whatsapp /path/whatsapp-dir --signal /path/signal-dir --audit-log /tmp/x/audit.log
-msgmcp gateway --listen 127.0.0.1:0 --token-file /tmp/x/token --database /path/chat.db ...   # prints its URL
+msgmcp socket --socket /tmp/x/service.sock --source imessage --database /path/chat.db --source signal --signal /path/signal-dir --contacts /path/AddressBook --audit-log /tmp/x/audit.log
+msgmcp gateway --listen 127.0.0.1:0 --token-file /tmp/x/token --source imessage --database /path/chat.db ...   # prints its URL
 msgmcp --socket /tmp/x/service.sock                                    # stdio adapter
 msgmcp --url http://127.0.0.1:<port>/mcp --token-file /tmp/x/token      # stdio adapter
 msgmcp --check-automation                                              # read-only AppleScript check

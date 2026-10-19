@@ -80,20 +80,25 @@ flowchart LR
 [SETUP.md](SETUP.md) is the step-by-step runbook, from a fresh checkout to a cloud agent
 connected, with a check for each step. An agent on the Mac can work through it with you.
 
-In short, `python3 scripts/reinstall.py --sign "<certificate>"` builds the release binary,
-installs `~/Applications/msgmcp.app` and its LaunchAgent, and checks that the service can
-read the stores. The first time, grant **msgmcp** Full Disk Access (to read `chat.db` and
-WhatsApp's group container) and run it again. With Signal Desktop set up, the script also
-runs `msgmcp --check-signal`, and macOS asks once whether msgmcp may use "Signal Safe
+In short, `python3 scripts/reinstall.py --sign "<certificate>" --source imessage --source
+whatsapp --source signal` builds the release binary, installs `~/Applications/msgmcp.app`
+and its LaunchAgent, and checks that the service can read the stores. Each `--source`
+enables one store, and nothing else is read: list only the apps you want agents to see
+(without `--source`, a first install lists the stores it found and stops). The first time,
+grant **msgmcp** Full Disk Access (to read `chat.db` and WhatsApp's group container; Signal
+doesn't need it) and run it again. When it serves Signal, the script also runs
+`msgmcp --check-signal`, and macOS asks once whether msgmcp may use "Signal Safe
 Storage" from the Keychain: choose Always Allow. Signal encrypts its database with a key
 that only that Keychain item unlocks, and the service never shows that dialog itself, so
 until it's allowed Signal is reported as unavailable. Automation → Messages (to send) is
 requested on the first send.
 
 **To reinstall after changes**, run `python3 scripts/reinstall.py` with no arguments. It reuses
-the installed app's certificate and service options, so macOS keeps its grants. Options:
-`--service socket`, `--allow-host my-mac.tail4f2e1c.ts.net`, `--allow-send`; passing any of them
-replaces the installed set. Restart MCP clients afterwards to pick up tool changes.
+the installed app's certificate, stores and service options, so macOS keeps its grants.
+`--source NAME` (repeatable) replaces the installed stores. Options: `--service socket`,
+`--allow-host my-mac.tail4f2e1c.ts.net`, `--allow-send` (needs iMessage); passing any of them
+replaces the installed set. Restart MCP clients afterwards to pick up tool changes. An
+install from before `--source` keeps serving iMessage and WhatsApp until you choose.
 
 macOS ties privacy grants to the app's signature, so the script refuses an ad hoc signature,
 which changes with every build. After switching certificates, macOS drops Full Disk Access
