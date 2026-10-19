@@ -2,7 +2,8 @@
 
 A local MCP server, written in Rust, for message history on a Mac. It reads iMessage
 and SMS from `chat.db` and WhatsApp Desktop from its `ChatStorage.sqlite`, both
-read-only, and sends iMessage text through the Messages app.
+read-only, looks people up in Contacts and WhatsApp's address book, and sends iMessage
+text through the Messages app.
 
 ## The problem
 
@@ -22,8 +23,8 @@ The obvious ways to bridge that gap are unsafe:
   into texting anyone.
 
 msgmcp gives a cloud agent a narrow door instead. One signed app on the Mac holds the
-permissions and offers a few tools: search, list and read conversations, and send an
-iMessage. Agents reach it only over your private Tailscale network, where they're tagged
+permissions and offers a few tools: search, list and read conversations, look up
+contacts, and send an iMessage. Agents reach it only over your private Tailscale network, where they're tagged
 and limited to that one port, and every request needs a token. The databases are opened
 read-only, results carry names from your Contacts, sending is off for remote agents
 unless you enable it and then reaches only people saved in Contacts, and every call lands in an audit log on the Mac. [Security](#security) lists
@@ -179,6 +180,8 @@ every call is in the [audit log](#remote-access).
 - **What people text you.** It can steer an agent into leaking what it reads, or, with
   `--allow-send`, texting your contacts. Approving drafts is the agent's rule, not the server's.
 - **WhatsApp names.** Senders choose them, so a stranger can show up as "Mom".
+- **Your address book.** `search_contacts` needs a query but returns anyone who matches,
+  so an agent can read most of your contacts with a few short queries.
 - **Your accounts.** The agent platform, GitHub and Tailscale can each let someone in.
 - **Programs running as you.** They can read the token and use the socket.
 

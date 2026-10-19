@@ -479,7 +479,7 @@ class EndToEnd(unittest.TestCase):
         tools = self.client.request('tools/list', {})['tools']
         self.assertEqual({t['name'] for t in tools}, {
             'list_conversations', 'search_messages', 'read_conversation',
-            'get_message_context', 'send_message'})
+            'get_message_context', 'search_contacts', 'send_message'})
         self.assertTrue(all(t['annotations']['readOnlyHint'] for t in tools if t['name'] != 'send_message'))
         send = next(t for t in tools if t['name'] == 'send_message')
         self.assertFalse(send['annotations']['readOnlyHint'])
@@ -630,6 +630,58 @@ class EndToEnd(unittest.TestCase):
                 message = error(recipient, ' ')
                 self.assertIn('not a phone number with a country code', message)
                 self.assertIn('Nothing was sent', message)
+
+    def test_search_contacts_merges_contacts_and_whatsapp(self):
+        sarah = {'names': [{'name': 'Sarah Test', 'source': 'contacts'}],
+                 'phone_numbers': ['+15550102030'], 'email_addresses': ['sarah@example.com'],
+                 'in_contacts': True}
+        # Without WhatsApp's address book, Contacts are still searched and the gap reported.
+        page = self.client.tool('search_contacts', query='sarah')
+        self.assertEqual(page['contacts'], [sarah])
+        self.assertEqual(page['contacts_databases_read'], 1)
+        self.assertEqual([u['source'] for u in page['unavailable_sources']], ['whatsapp'])
+        with sqlite3.connect(self.whatsapp / 'ContactsV2.sqlite') as wa:
+            wa.executescript('''
+                CREATE TABLE ZWAADDRESSBOOKCONTACT(ZWHATSAPPID TEXT, ZLID TEXT, ZPHONENUMBER TEXT, ZFULLNAME TEXT);
+                INSERT INTO ZWAADDRESSBOOKCONTACT VALUES
+                    ('393331234567@s.whatsapp.net', '111@lid', '+393331234567', 'Marco Mobile'),
+                    ('447700900999@s.whatsapp.net', '777@lid', '+447700900999', 'Dana WA'),
+                    ('447700900888@s.whatsapp.net', NULL, NULL, '  ');
+            ''')
+        wa.close()
+        # Marco is in both, joined by his number; each name keeps its source.
+        marco = {'names': [{'name': 'Marco Rossi', 'source': 'contacts'},
+                           {'name': 'Marco Mobile', 'source': 'whatsapp'}],
+                 'phone_numbers': ['+393331234567'], 'email_addresses': [],
+                 'whatsapp_jids': ['393331234567@s.whatsapp.net', '111@lid'], 'in_contacts': True}
+        for query in ('marco', 'MOBILE', '+39 333 123 4567', '333-123', '111@lid'):
+            with self.subTest(query=query):
+                page = self.client.tool('search_contacts', query=query)
+                self.assertEqual(page['contacts'], [marco])
+                self.assertTrue(page['complete'])
+                self.assertNotIn('unavailable_sources', page)
+        dana = {'names': [{'name': 'Dana WA', 'source': 'whatsapp'}],
+                'phone_numbers': ['+447700900999'], 'email_addresses': [],
+                'whatsapp_jids': ['447700900999@s.whatsapp.net', '777@lid'], 'in_contacts': False}
+        self.assertEqual(self.client.tool('search_contacts', query='dana')['contacts'], [dana])
+        self.assertEqual(self.client.tool('search_contacts', query='absent')['contacts'], [])
+        # Sorted by first name; a limit below the matches says so.
+        page = self.client.tool('search_contacts', query='a', limit=2)
+        self.assertEqual([c['names'][0]['name'] for c in page['contacts']], ['Dana WA', 'Marco Rossi'])
+        self.assertFalse(page['complete'])
+        # Two Contacts records sharing an email address are one person with both names.
+        path = self.root / 'contacts/Sources/test/AddressBook-v22.abcddb'
+        with sqlite3.connect(path) as cn:
+            cn.executescript("INSERT INTO ZABCDRECORD VALUES(2,'Other','Person',NULL,NULL); INSERT INTO ZABCDEMAILADDRESS VALUES('SARAH@example.com',2);")
+        cn.close()
+        page = self.client.tool('search_contacts', query='sarah@')
+        self.assertEqual(page['contacts'], [{**sarah, 'names': [
+            {'name': 'Other Person', 'source': 'contacts'}, {'name': 'Sarah Test', 'source': 'contacts'}]}])
+        # Neither source readable is an error.
+        missing = self.start_client(self.root / 'missing-contacts', self.root / 'missing-whatsapp')
+        result = missing.request('tools/call', {'name': 'search_contacts', 'arguments': {'query': 'sarah'}})
+        self.assertTrue(result['isError'])
+        self.assertIn('Neither macOS Contacts nor', result['content'][0]['text'])
 
     def test_audit_log(self):
         self.client.tool('search_messages', text='dinner', limit=1)
@@ -822,6 +874,9 @@ class EndToEnd(unittest.TestCase):
             ('read_conversation', {'conversation_id': 'whatsapp:1', 'cursor': 'whatsapp:x:1'}, 'Invalid cursor'),
             ('search_messages', {'text': 'x', 'source': 'imessage', 'cursor': 'whatsapp:'}, 'Cursor does not match'),
             ('search_messages', {'text': ' '}, 'text is required'),
+            ('search_contacts', {'query': ' '}, 'query is required'),
+            ('search_contacts', {}, 'query'),
+            ('search_contacts', {'query': 'a', 'limit': 201}, 'limit'),
             ('search_messages', {'text': 'dinner', 'after': timestamp(DATE), 'before': timestamp(DATE)}, 'earlier'),
             ('get_message_context', {'conversation_id': 'imessage:2', 'message_id': 'imessage:2'}, 'Message not found'),
             ('get_message_context', {'conversation_id': 'whatsapp:1', 'message_id': 'whatsapp:6'}, 'Message not found'),

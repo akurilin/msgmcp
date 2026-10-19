@@ -92,7 +92,30 @@ pub fn address_contains(address: &str, query: &str) -> bool {
 }
 
 pub fn load_contacts(root: &Path) -> (Contacts, usize) {
+    let (records, readable) = load_contact_records(root);
     let mut contacts = Contacts::new();
+    for record in records {
+        for address in &record.addresses {
+            let key = address_key(address);
+            if !key.is_empty() {
+                contacts.entry(key).or_default().insert(record.name.clone());
+            }
+        }
+    }
+    (contacts, readable)
+}
+
+/// One person saved in macOS Contacts, with every phone number and email address saved
+/// for them, as saved.
+pub struct ContactRecord {
+    pub name: String,
+    pub addresses: Vec<String>,
+}
+
+/// Every AddressBook record that has a name and an address, and how many AddressBook
+/// databases were read. Each account (iCloud, Google, On My Mac) has its own database.
+pub fn load_contact_records(root: &Path) -> (Vec<ContactRecord>, usize) {
+    let mut records = Vec::new();
     let mut readable = 0;
     let pattern = root
         .join("Sources/*/AddressBook-v22.abcddb")
@@ -109,24 +132,28 @@ pub fn load_contacts(root: &Path) -> (Contacts, usize) {
     }
     for path in paths {
         let Ok(db) = open(&path) else { continue };
-        let sql = "SELECT p.ZFULLNUMBER, r.ZFIRSTNAME, r.ZLASTNAME, r.ZNICKNAME, r.ZORGANIZATION FROM ZABCDPHONENUMBER p JOIN ZABCDRECORD r ON p.ZOWNER=r.Z_PK UNION ALL SELECT e.ZADDRESS, r.ZFIRSTNAME, r.ZLASTNAME, r.ZNICKNAME, r.ZORGANIZATION FROM ZABCDEMAILADDRESS e JOIN ZABCDRECORD r ON e.ZOWNER=r.Z_PK";
+        let sql = "SELECT r.Z_PK, p.ZFULLNUMBER, r.ZFIRSTNAME, r.ZLASTNAME, r.ZNICKNAME, r.ZORGANIZATION FROM ZABCDPHONENUMBER p JOIN ZABCDRECORD r ON p.ZOWNER=r.Z_PK UNION ALL SELECT r.Z_PK, e.ZADDRESS, r.ZFIRSTNAME, r.ZLASTNAME, r.ZNICKNAME, r.ZORGANIZATION FROM ZABCDEMAILADDRESS e JOIN ZABCDRECORD r ON e.ZOWNER=r.Z_PK";
         let Ok(mut stmt) = db.prepare(sql) else {
             continue;
         };
         let Ok(rows) = stmt.query_map([], |r| {
             Ok((
-                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<i64>>(0)?,
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         }) else {
             continue;
         };
         readable += 1;
-        for (address, first, last, nickname, organization) in rows.flatten() {
-            let Some(address) = address else { continue };
+        let mut by_record = BTreeMap::<Option<i64>, ContactRecord>::new();
+        for (id, address, first, last, nickname, organization) in rows.flatten() {
+            let Some(address) = address.filter(|a| !address_key(a).is_empty()) else {
+                continue;
+            };
             let full = format!("{} {}", first.unwrap_or_default(), last.unwrap_or_default())
                 .trim()
                 .to_owned();
@@ -135,13 +162,20 @@ pub fn load_contacts(root: &Path) -> (Contacts, usize) {
             } else {
                 nickname.or(organization).unwrap_or_default()
             };
-            let key = address_key(&address);
-            if !key.is_empty() && !name.is_empty() {
-                contacts.entry(key).or_default().insert(name);
+            if !name.is_empty() {
+                by_record
+                    .entry(id)
+                    .or_insert_with(|| ContactRecord {
+                        name,
+                        addresses: Vec::new(),
+                    })
+                    .addresses
+                    .push(address);
             }
         }
+        records.extend(by_record.into_values());
     }
-    (contacts, readable)
+    (records, readable)
 }
 
 /// Names saved in Contacts for `address`, in whatever format either side has it.

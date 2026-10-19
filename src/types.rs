@@ -269,3 +269,54 @@ pub struct SendReceipt {
     /// The recipient address as sent: a phone number in E.164, or the email address.
     pub recipient: String,
 }
+
+/// Where a contact's name came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NameSource {
+    /// macOS Contacts, as the user saved it.
+    Contacts,
+    /// WhatsApp's address book: the name saved for this number on the user's phone, as
+    /// WhatsApp synced it. Not the person's self-chosen WhatsApp profile name.
+    Whatsapp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
+pub struct ContactName {
+    pub name: String,
+    pub source: NameSource,
+}
+
+/// One person, merged from every entry in macOS Contacts and WhatsApp's address book that
+/// shares a phone number, email address or WhatsApp JID with it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct Contact {
+    /// Every name saved for this person, macOS Contacts first, each with its source. Two
+    /// entries that share an address (a family email, say) merge, so names can differ.
+    pub names: Vec<ContactName>,
+    /// Phone numbers in E.164 when the country is known, otherwise as saved.
+    pub phone_numbers: Vec<String>,
+    pub email_addresses: Vec<String>,
+    /// WhatsApp JIDs, such as `<digits>@s.whatsapp.net` or an opaque `<id>@lid`. Omitted when
+    /// the person isn't in WhatsApp's address book.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub whatsapp_jids: Vec<String>,
+    /// True when the person is saved in macOS Contacts. send_message accepts only phone
+    /// numbers and email addresses saved there.
+    pub in_contacts: bool,
+}
+
+/// Result of search_contacts.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ContactList {
+    /// Sorted by first name, case-insensitively.
+    pub contacts: Vec<Contact>,
+    /// False when more people matched than `limit`; narrow the query to see the rest.
+    pub complete: bool,
+    /// Number of AddressBook databases read; 0 means nothing from macOS Contacts.
+    pub contacts_databases_read: usize,
+    /// Present only when WhatsApp's address book could not be read; the macOS Contacts
+    /// results are still returned.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_sources: Vec<Unavailable>,
+}

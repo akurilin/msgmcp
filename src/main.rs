@@ -2,6 +2,7 @@ mod audit;
 mod caller;
 mod client;
 mod common;
+mod contacts;
 mod gateway;
 mod imessage;
 mod socket;
@@ -11,8 +12,8 @@ mod whatsapp;
 use anyhow::{Context, Result, bail};
 use client::Endpoint;
 use common::{
-    Filter, MAX_CONTEXT, SCAN_LIMIT, e164, is_contact, keep_conversation, limit, load_contacts,
-    parse_time,
+    Filter, MAX_CONTEXT, SCAN_LIMIT, e164, is_contact, keep_conversation, limit,
+    load_contact_records, load_contacts, parse_time,
 };
 use rmcp::{
     ServerHandler,
@@ -28,7 +29,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command, sync::Arc};
 use types::{
-    ALL_SOURCES, ConversationList, MessageContext, MessageList, SendReceipt, Source, Unavailable,
+    ALL_SOURCES, ContactList, ConversationList, MessageContext, MessageList, SendReceipt, Source,
+    Unavailable,
 };
 
 /// Parse a source-qualified ID such as `imessage:2771` or `whatsapp:45`.
@@ -126,6 +128,15 @@ struct ContextRequest {
     before: Option<usize>,
     /// Number of later messages to include, 0 to 100; default 5.
     after: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct ContactSearch {
+    /// Required. Case-insensitive substring of a name, phone number, email address or
+    /// WhatsApp JID. Phone numbers match in any format and in part, as in list_conversations.
+    query: String,
+    /// Most people to return, 1 to 200; default 50.
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -453,6 +464,53 @@ impl Server {
         self.messages(p, false, &extensions).await
     }
     #[tool(
+        output_schema = output_schema::<ContactList>(),
+        annotations(read_only_hint = true),
+        description = "Look up people in the user's macOS Contacts and WhatsApp's address book by name, phone number, email address or WhatsApp JID; a query is required. Entries that share a phone number, email address or JID are merged into one person, and each name carries its source (contacts or whatsapp). Use it to find someone's number or email for send_message (in_contacts must be true), or the addresses to look for with list_conversations."
+    )]
+    async fn search_contacts(
+        &self,
+        Parameters(p): Parameters<ContactSearch>,
+        extensions: Extensions,
+    ) -> Result<Json<ContactList>, String> {
+        self.run(
+            "search_contacts",
+            audit_arguments(&p),
+            &extensions,
+            move |paths| {
+                let cap = limit(p.limit)?;
+                if p.query.trim().is_empty() {
+                    bail!("query is required and must not be empty")
+                }
+                let (records, readable) = load_contact_records(&paths.contacts);
+                let (whatsapp, missing) = match whatsapp::address_book(&paths.whatsapp) {
+                    Ok(entries) => (entries, Vec::new()),
+                    Err(error) => (
+                        Vec::new(),
+                        vec![Unavailable {
+                            source: Source::Whatsapp,
+                            error: format!("{error:#}"),
+                        }],
+                    ),
+                };
+                if readable == 0 && !missing.is_empty() {
+                    bail!(
+                        "Neither macOS Contacts nor WhatsApp's address book could be read: {}",
+                        missing[0].error
+                    )
+                }
+                let (contacts, complete) = contacts::search(records, whatsapp, &p.query, cap);
+                Ok(ContactList {
+                    contacts,
+                    complete,
+                    contacts_databases_read: readable,
+                    unavailable_sources: missing,
+                })
+            },
+        )
+        .await
+    }
+    #[tool(
         output_schema = output_schema::<MessageContext>(),
         annotations(read_only_hint = true),
         description = "Read a message and nearby messages in its conversation. Source-qualified IDs come from search_messages or read_conversation."
@@ -599,7 +657,7 @@ impl Server {
 }
 const INSTRUCTIONS: &str = "Search and read the user’s iMessage, SMS and WhatsApp history on this Mac. To find messages by person, first call list_conversations with their name; for unread conversations, call list_conversations with unread_only; for recent activity, call list_conversations with active_after, then read_conversation with order newest_first and a small limit; a person can have both an imessage: and a whatsapp: conversation. IDs are source-qualified strings such as imessage:2771 or whatsapp:45.";
 const SEND_INSTRUCTIONS: &str = " Send messages (iMessage only) only when the user asks. Sending returns submission, not delivery confirmation; never retry automatically.";
-const COMMON_INSTRUCTIONS: &str = " Follow continuation cursors with the same filters. Times use RFC 3339. Phone numbers are E.164 in results and match in any format in arguments. Contact names are optional.";
+const COMMON_INSTRUCTIONS: &str = " Follow continuation cursors with the same filters. Times use RFC 3339. Phone numbers are E.164 in results and match in any format in arguments. Contact names are optional. To look up a person's numbers and addresses, call search_contacts.";
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Server {

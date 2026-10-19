@@ -5,7 +5,7 @@
 //!   group members, media items (captions, reply metadata) and receipt info (reactions).
 //! - `LID.sqlite` and `ContactsV2.sqlite`: optional; map opaque `@lid` identities to
 //!   phone numbers and WhatsApp's own contact names.
-use crate::common::{APPLE_EPOCH, Contacts, Filter, Listed, Page, contact_name, open};
+use crate::common::{APPLE_EPOCH, Contacts, Filter, Listed, Page, contact_name, e164, open};
 use crate::types::{ChatType, Conversation, Kind, Message, Person, Reaction, Source, TextStatus};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -28,6 +28,56 @@ fn chat_storage(dir: &Path) -> Result<Connection> {
         bail!("WhatsApp database not found at {}", path.display())
     }
     open(&path)
+}
+
+/// One person in WhatsApp's address book: the name saved for their number on the user's
+/// phone, as WhatsApp synced it.
+pub struct AddressBookEntry {
+    pub name: String,
+    /// E.164.
+    pub phone: Option<String>,
+    /// Normalized JIDs: the phone JID and the `@lid` identity.
+    pub jids: Vec<String>,
+}
+
+/// WhatsApp's address book, from `ContactsV2.sqlite`.
+pub fn address_book(dir: &Path) -> Result<Vec<AddressBookEntry>> {
+    let path = dir.join("ContactsV2.sqlite");
+    if !path.exists() {
+        bail!("WhatsApp address book not found at {}", path.display())
+    }
+    let db = open(&path)?;
+    let mut stmt =
+        db.prepare("SELECT ZWHATSAPPID, ZLID, ZPHONENUMBER, ZFULLNAME FROM ZWAADDRESSBOOKCONTACT")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let (wa, lid, phone, name) = row?;
+        let Some(name) = name.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        let jids: Vec<String> = [wa, lid]
+            .into_iter()
+            .flatten()
+            .filter(|j| j.contains('@'))
+            .map(|j| normalize_jid(&j))
+            .collect();
+        // The number is stored in E.164; a phone JID carries it too.
+        let phone = phone.as_deref().and_then(e164).or_else(|| {
+            jids.iter()
+                .find_map(|j| j.strip_suffix("@s.whatsapp.net"))
+                .and_then(|d| e164(&format!("+{}", digits(d))))
+        });
+        entries.push(AddressBookEntry { name, phone, jids });
+    }
+    Ok(entries)
 }
 
 /// Strip a device suffix: `123:4@s.whatsapp.net` → `123@s.whatsapp.net`.

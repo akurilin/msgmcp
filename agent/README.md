@@ -36,6 +36,7 @@ Each shell command needs `source agent/msgmcp.sh` first. Then call tools like th
     msgmcp read_conversation '{"conversation_id": "imessage:2771", "order": "newest_first", "limit": 20}'
     msgmcp search_messages '{"text": "dinner", "after": "2026-10-01T00:00:00Z"}'
     msgmcp get_message_context '{"conversation_id": "whatsapp:45", "message_id": "whatsapp:123"}'
+    msgmcp search_contacts '{"query": "sarah"}'
 
 The answer is in `.result.structuredContent`. If `.result.isError` is true, the tool
 failed and `.result.content[0].text` says why.
@@ -43,6 +44,9 @@ failed and `.result.content[0].text` says why.
 - Tool names and arguments: the tool list you fetched at setup (see above).
 - To find someone: list_conversations with their name. One person can have both an
   `imessage:` and a `whatsapp:` conversation.
+- For someone's numbers and email addresses, including people with no conversations:
+  search_contacts with their name. Each name says whether it came from macOS Contacts
+  or WhatsApp's address book.
 - For recent activity: list_conversations with `active_after`, then read_conversation
   with `order: "newest_first"` and a small `limit`.
 - For what the user hasn't read: list_conversations with `"unread_only": true`. Like the
@@ -62,8 +66,8 @@ failed and `.result.content[0].text` says why.
   Draft first, show the draft, and wait for an explicit yes. Approval covers that one
   message: draft again for any change.
 - The recipient is a phone number with country code or an email address, taken from a
-  conversation's `participants`. It must be saved in the user's Contacts; anyone else is
-  refused. Group chats and WhatsApp can't be sent to.
+  conversation's `participants` or from search_contacts. It must be saved in the user's
+  Contacts (`in_contacts` is true); anyone else is refused. Group chats and WhatsApp can't be sent to.
 - The text goes inside JSON: escape quotes and newlines (`\"`, `\n`).
 - A success means submitted, not delivered. Never retry a send, even after an error: a
   failed call may still have sent the message. Tell the user instead.
