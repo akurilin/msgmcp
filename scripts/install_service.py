@@ -26,9 +26,11 @@ SOURCES = {
     'imessage': HOME / 'Library/Messages/chat.db',
     'whatsapp': HOME / 'Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite',
     'signal': HOME / 'Library/Application Support/Signal/sql/db.sqlite',
+    'telegram': HOME / 'Library/Group Containers/6N38VWS5BX.ru.keepcoder.Telegram',
 }
-# Stores read only with Full Disk Access; Signal's folder isn't protected.
-FULL_DISK_ACCESS = ('imessage', 'whatsapp')
+# Stores read only with Full Disk Access; Signal's folder isn't protected. Telegram's group
+# container is protected like WhatsApp's.
+FULL_DISK_ACCESS = ('imessage', 'whatsapp', 'telegram')
 # What a LaunchAgent from before --source read.
 LEGACY_SOURCES = ['imessage', 'whatsapp']
 

@@ -14,7 +14,7 @@
 //! - `items`: key-value settings, including the user's own account ID.
 use crate::backend::Backend;
 use crate::common::{
-    Contacts, Filter, Listed, Page, contact_name, display_address, neighbors, page,
+    Contacts, Filter, Listed, Page, contact_name, display_address, message_number, neighbors, page,
 };
 use crate::types::{ChatType, Conversation, Kind, Message, Person, Reaction, Source, TextStatus};
 use anyhow::{Context, Result, bail};
@@ -62,11 +62,17 @@ impl Backend for Signal {
         &self,
         contacts: &Contacts,
         conversation: &str,
-        message: i64,
+        message: &str,
         before: usize,
         after: usize,
     ) -> Result<Vec<Message>> {
-        context(&self.0, contacts, conversation, message, (before, after))
+        context(
+            &self.0,
+            contacts,
+            conversation,
+            message_number(message)?,
+            (before, after),
+        )
     }
 }
 const DATABASE: &str = "sql/db.sqlite";
@@ -288,6 +294,8 @@ impl Directory {
             address,
             jid: None,
             signal_id: profile.service_id.clone(),
+            telegram_id: None,
+            telegram_username: None,
             name,
             ambiguous,
         }
@@ -306,6 +314,8 @@ impl Directory {
                 address: None,
                 jid: None,
                 signal_id: Some(service_id),
+                telegram_id: None,
+                telegram_username: None,
                 name: None,
                 ambiguous: false,
             })

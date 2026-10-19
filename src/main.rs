@@ -8,6 +8,7 @@ mod gateway;
 mod imessage;
 mod signal;
 mod socket;
+mod telegram;
 mod types;
 mod whatsapp;
 
@@ -16,7 +17,7 @@ use backend::{Backend, STORES, and_list, store};
 use client::Endpoint;
 use common::{
     Filter, MAX_CONTEXT, SCAN_LIMIT, e164, is_contact, keep_conversation, limit,
-    load_contact_records, load_contacts, number, parse_time,
+    load_contact_records, load_contacts, parse_time,
 };
 use rmcp::{
     ServerHandler,
@@ -45,13 +46,13 @@ fn source_names(sources: &[Source], last: &str) -> String {
 }
 
 /// Parse a source-qualified ID such as `imessage:2771`, `whatsapp:45` or `signal:<uuid>`
-/// into its source and backend-local ID. Message IDs are integers in every store;
-/// conversation IDs are integers except where the store says otherwise.
-fn parse_id(id: &str) -> Result<(Source, String)> {
+/// into its source and backend-local ID. Conversation IDs are integers except where the
+/// store says otherwise; the store checks its own message IDs.
+fn parse_id(id: &str, message: bool) -> Result<(Source, String)> {
     id.split_once(':')
         .and_then(|(p, local)| {
             let source = Source::parse(p)?;
-            let valid = if store(source).numeric_ids {
+            let valid = if store(source).numeric_ids && !message {
                 local.parse::<i64>().is_ok()
             } else {
                 !local.is_empty() && !local.contains(char::is_whitespace)
@@ -113,7 +114,7 @@ struct Server {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Conversations {
     /// Case-insensitive substring of a chat name, identifier, participant address, WhatsApp
-    /// JID, Signal ID, or contact name.
+    /// JID, Signal ID, Telegram user ID or @username, or contact name.
     /// Phone numbers match in any format and in part: "(555) 123-4567", "5551234567" and
     /// "555-1234" all find +15551234567.
     query: Option<String>,
@@ -127,8 +128,8 @@ struct Conversations {
     unread_only: Option<bool>,
     /// With unread_only: also return archived chats.
     include_archived: Option<bool>,
-    /// With unread_only: also return filtered iMessage chats (unknown senders, automated
-    /// senders and junk).
+    /// With unread_only: also return filtered iMessage and Telegram chats (unknown senders,
+    /// automated senders and junk).
     include_filtered: Option<bool>,
     /// Page size, 1 to 200; default 50.
     limit: Option<usize>,
@@ -146,15 +147,16 @@ enum MessageOrder {
 }
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Messages {
-    /// Source-qualified conversation ID, e.g. "imessage:2771", "whatsapp:45" or
-    /// "signal:<uuid>".
+    /// Source-qualified conversation ID, e.g. "imessage:2771", "whatsapp:45", "signal:<uuid>"
+    /// or "telegram:4416".
     conversation_id: Option<String>,
     /// Restrict to one source when conversation_id is omitted; omit to search all.
     source: Option<Source>,
     /// Case-insensitive literal text. Required for search_messages.
     text: Option<String>,
-    /// Exact address, WhatsApp JID, Signal ID, contact-name substring, or "me". A phone number matches
-    /// in any format; one without a country code is taken as North American (+1).
+    /// Exact address, WhatsApp JID, Signal ID, Telegram user ID or @username, contact-name
+    /// substring, or "me". A phone number matches in any format; one without a country code is
+    /// taken as North American (+1).
     sender: Option<String>,
     /// RFC 3339 time, inclusive.
     after: Option<String>,
@@ -204,8 +206,10 @@ fn plan(
     source: Option<Source>,
     conversation: Option<&str>,
 ) -> Result<(Vec<Source>, Option<String>, bool)> {
-    let (sources, conversation, explicit) = match (conversation.map(parse_id).transpose()?, source)
-    {
+    let (sources, conversation, explicit) = match (
+        conversation.map(|c| parse_id(c, false)).transpose()?,
+        source,
+    ) {
         (Some((s, _)), Some(requested)) if s != requested => {
             bail!(
                 "source {requested} does not match conversation_id {}",
@@ -371,7 +375,7 @@ impl Server {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        description = "Send an iMessage through the macOS Messages app (WhatsApp and Signal sending are not supported). Supply the recipient's phone number or email address, as in list_conversations participants; the recipient must be saved in the user's Contacts; contact names and group chats are not supported. No SMS fallback. Use only when the user asks to send. Returns submitted, not delivery confirmation. Never retry automatically."
+        description = "Send an iMessage through the macOS Messages app (WhatsApp, Signal and Telegram sending are not supported). Supply the recipient's phone number or email address, as in list_conversations participants; the recipient must be saved in the user's Contacts; contact names and group chats are not supported. No SMS fallback. Use only when the user asks to send. Returns submitted, not delivery confirmation. Never retry automatically."
     )]
     async fn send_message(
         &self,
@@ -405,7 +409,7 @@ impl Server {
     #[tool(
         output_schema = output_schema::<ConversationList>(),
         annotations(read_only_hint = true),
-        description = "List iMessage/SMS, WhatsApp and Signal conversations, newest activity first across all sources. Filter by recent activity (active_after), unread messages (unread_only, which skips archived and filtered chats by default), chat name, participant address, WhatsApp JID or Signal ID, or contact name. Each item has an unread_count and a source-qualified conversation_id (imessage:N, whatsapp:N or signal:<uuid>). Follow next_cursor until complete."
+        description = "List iMessage/SMS, WhatsApp, Signal and Telegram conversations, newest activity first across all sources. Filter by recent activity (active_after), unread messages (unread_only, which skips archived and filtered chats by default), chat name, participant address, WhatsApp JID, Signal ID or Telegram username, or contact name. Each item has an unread_count and a source-qualified conversation_id (imessage:N, whatsapp:N, signal:<uuid> or telegram:N). Follow next_cursor until complete."
     )]
     async fn list_conversations(
         &self,
@@ -478,7 +482,7 @@ impl Server {
     #[tool(
         output_schema = output_schema::<MessageList>(),
         annotations(read_only_hint = true),
-        description = "Search decoded iMessage/SMS, WhatsApp and Signal text using a case-insensitive literal substring. Optional source, conversation, date and sender filters. Without a source or conversation, iMessage results come first, then WhatsApp, then Signal. Scans at most 10000 rows per call; follow next_cursor until complete."
+        description = "Search decoded iMessage/SMS, WhatsApp, Signal and Telegram text using a case-insensitive literal substring. Optional source, conversation, date and sender filters. Without a source or conversation, iMessage results come first, then WhatsApp, Signal and Telegram. Scans at most 10000 rows per call; follow next_cursor until complete."
     )]
     async fn search_messages(
         &self,
@@ -490,7 +494,7 @@ impl Server {
     #[tool(
         output_schema = output_schema::<MessageList>(),
         annotations(read_only_hint = true),
-        description = "Read one conversation. conversation_id (e.g. imessage:2771, whatsapp:45 or signal:<uuid>) is required. Messages are oldest first; pass order newest_first with limit N to get the latest N. Use next_cursor for more messages; date filters use RFC 3339."
+        description = "Read one conversation. conversation_id (e.g. imessage:2771, whatsapp:45, signal:<uuid> or telegram:4416) is required. Messages are oldest first; pass order newest_first with limit N to get the latest N. Use next_cursor for more messages; date filters use RFC 3339."
     )]
     async fn read_conversation(
         &self,
@@ -575,15 +579,15 @@ impl Server {
                 if before > MAX_CONTEXT || after > MAX_CONTEXT {
                     bail!("before and after must not exceed {MAX_CONTEXT}")
                 }
-                let (source, conversation) = parse_id(&p.conversation_id)?;
-                let (message_source, message) = parse_id(&p.message_id)?;
+                let (source, conversation) = parse_id(&p.conversation_id, false)?;
+                let (message_source, message) = parse_id(&p.message_id, true)?;
                 if source != message_source {
                     bail!("message_id and conversation_id must come from the same source")
                 }
                 let backend = stores.get(source)?;
-                let message = number(&message).context("Message not found in conversation")?;
                 let (contacts, readable) = load_contacts(&stores.contacts);
-                let messages = backend.context(&contacts, &conversation, message, before, after)?;
+                let messages =
+                    backend.context(&contacts, &conversation, &message, before, after)?;
                 Ok(MessageContext {
                     messages,
                     contacts_databases_read: readable,

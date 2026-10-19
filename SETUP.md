@@ -29,8 +29,8 @@ this file only says what to do and how to tell it worked.
   is the user's job, even when you've done the steps around it.
 - **Print no message data.** The checks here print PASS/FAIL, counts and tool names. Don't
   call tools to show what they return.
-- **Each message store is the user's choice.** Ask which of iMessage/SMS, WhatsApp and
-  Signal agents may read (step 2); serve only those.
+- **Each message store is the user's choice.** Ask which of iMessage/SMS, WhatsApp, Signal
+  and Telegram agents may read (step 2); serve only those.
 - **Sending is the user's choice.** Ask before adding `--allow-send` (step 7). Never send a
   real message during setup.
 - **Stop on a failure you can't explain.** Report the command and its error. Don't work
@@ -74,12 +74,13 @@ python3 scripts/reinstall.py --sign "Apple Development: jane@example.com (A1B2C3
 
 Later runs keep these stores; passing `--source` again replaces the set. The script builds,
 installs `~/Applications/msgmcp.app` and its LaunchAgent, then reads a little from each
-store. When it serves iMessage or WhatsApp, a first install stops there with a Full Disk
-Access error. That's expected: go to step 3.
+store. When it serves iMessage, WhatsApp or Telegram, a first install stops there with a Full
+Disk Access error. That's expected: go to step 3. Telegram means Telegram for macOS, the
+native app; msgmcp can't read it while its Passcode Lock is on.
 
 ### 3. Full Disk Access
 
-Needed for iMessage and WhatsApp; Signal's folder isn't protected. Open System Settings → Privacy & Security → Full Disk Access, click "+", press ⌘⇧G, enter
+Needed for iMessage, WhatsApp and Telegram; Signal's folder isn't protected. Open System Settings → Privacy & Security → Full Disk Access, click "+", press ⌘⇧G, enter
 `~/Applications/msgmcp.app` and turn it on. macOS asks the user for their password or
 Touch ID. Then:
 
@@ -223,7 +224,7 @@ secrets:
 Put this in the agent's chat or saved instructions, with the repository it can read
 (`git remote get-url origin` shows this checkout's):
 
-> You can read my iMessage, SMS, WhatsApp and Signal history, and send iMessages once I approve
+> You can read my iMessage, SMS, WhatsApp, Signal and Telegram history, and send iMessages once I approve
 > a draft, through msgmcp. At the start of every session, fetch the `agent/` folder of
 > github.com/jane-doe/msgmcp fresh and follow `agent/README.md`. If any setup check
 > fails, stop and tell me.

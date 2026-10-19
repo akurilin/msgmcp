@@ -7,8 +7,8 @@
 //!   phone numbers and WhatsApp's own contact names.
 use crate::backend::Backend;
 use crate::common::{
-    APPLE_EPOCH, Contacts, Filter, Listed, Page, contact_name, e164, neighbors, number, open, page,
-    probe,
+    APPLE_EPOCH, Contacts, Filter, Listed, Page, contact_name, e164, message_number, neighbors,
+    number, open, page, probe,
 };
 use crate::types::{ChatType, Conversation, Kind, Message, Person, Reaction, Source, TextStatus};
 use anyhow::{Context, Result, bail};
@@ -54,7 +54,7 @@ impl Backend for Whatsapp {
         &self,
         contacts: &Contacts,
         conversation: &str,
-        message: i64,
+        message: &str,
         before: usize,
         after: usize,
     ) -> Result<Vec<Message>> {
@@ -62,7 +62,7 @@ impl Backend for Whatsapp {
             &self.0,
             contacts,
             number(conversation)?,
-            message,
+            message_number(message)?,
             (before, after),
         )
     }
@@ -299,6 +299,8 @@ impl Directory {
             address: Some(address),
             jid: Some(jid),
             signal_id: None,
+            telegram_id: None,
+            telegram_username: None,
             name,
             ambiguous,
         }
@@ -461,6 +463,8 @@ fn message(
                 address: None,
                 jid: None,
                 signal_id: None,
+                telegram_id: None,
+                telegram_username: None,
                 name: None,
                 ambiguous: false,
             },

@@ -1,6 +1,6 @@
 # Instructions for agents in cloud sandboxes
 
-You can read the user's iMessage, SMS, WhatsApp and Signal history through msgmcp, a server on
+You can read the user's iMessage, SMS, WhatsApp, Signal and Telegram history through msgmcp, a server on
 their Mac. You reach it over their private Tailscale network. Your environment has the
 server's address in `MSGMCP_URL` (such as `https://my-mac.tail4f2e1c.ts.net/mcp`) and two
 secrets: `TS_AUTHKEY` (joins the network) and `MSGMCP_TOKEN` (authorizes requests). Never
@@ -43,8 +43,12 @@ failed and `.result.content[0].text` says why.
 
 - Tool names and arguments: the tool list you fetched at setup (see above).
 - To find someone: list_conversations with their name. One person can have an
-  `imessage:`, a `whatsapp:` and a `signal:` conversation. Signal often hides phone
-  numbers, so a Signal participant may have only a `signal_id` and a name.
+  `imessage:`, a `whatsapp:`, a `signal:` and a `telegram:` conversation. Signal and
+  Telegram often hide phone numbers, so a participant may have only a `signal_id`, or a
+  `telegram_id` and `telegram_username`, and a name.
+- Telegram history is what the user's Mac app has cached, so older messages may be
+  missing. Telegram chats marked `filtered` are bots, service notices and strangers the
+  user never wrote to, mostly spam.
 - For someone's numbers and email addresses, including people with no conversations:
   search_contacts with their name. Each name says whether it came from macOS Contacts
   or WhatsApp's address book.
@@ -68,7 +72,7 @@ failed and `.result.content[0].text` says why.
   message: draft again for any change.
 - The recipient is a phone number with country code or an email address, taken from a
   conversation's `participants` or from search_contacts. It must be saved in the user's
-  Contacts (`in_contacts` is true); anyone else is refused. Group chats, WhatsApp and Signal can't be sent to.
+  Contacts (`in_contacts` is true); anyone else is refused. Group chats, WhatsApp, Signal and Telegram can't be sent to.
 - The text goes inside JSON: escape quotes and newlines (`\"`, `\n`).
 - A success means submitted, not delivered. Never retry a send, even after an error: a
   failed call may still have sent the message. Tell the user instead.

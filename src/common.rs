@@ -215,6 +215,8 @@ pub fn person(address: Option<String>, contacts: &Contacts) -> Person {
         address: address.as_deref().map(display_address),
         jid: None,
         signal_id: None,
+        telegram_id: None,
+        telegram_username: None,
         name,
         ambiguous,
     }
@@ -223,6 +225,11 @@ pub fn person(address: Option<String>, contacts: &Contacts) -> Person {
 /// A backend-local ID that the store keeps as an integer.
 pub fn number(id: &str) -> Result<i64> {
     id.parse().ok().context("Unknown conversation ID")
+}
+
+/// A backend-local message ID that the store keeps as an integer.
+pub fn message_number(id: &str) -> Result<i64> {
+    id.parse().ok().context("Message not found in conversation")
 }
 
 pub fn limit(value: Option<usize>) -> Result<usize> {
@@ -266,14 +273,16 @@ impl Filter {
             let key = address_key(s);
             let sender = &item.sender;
             !item.is_from_me
-                && ([&sender.address, &sender.jid, &sender.signal_id]
-                    .into_iter()
-                    .flatten()
-                    .any(|a| a.to_lowercase() == *s || (!key.is_empty() && address_key(a) == key))
-                    || sender
-                        .name
-                        .as_ref()
-                        .is_some_and(|n| n.to_lowercase().contains(s)))
+                && (sender.address.iter().chain(sender.ids()).any(|a| {
+                    let a = a.to_lowercase();
+                    // Telegram usernames are written with or without the @.
+                    a == *s
+                        || s.strip_prefix('@') == Some(a.as_str())
+                        || (!key.is_empty() && address_key(&a) == key)
+                }) || sender
+                    .name
+                    .as_ref()
+                    .is_some_and(|n| n.to_lowercase().contains(s)))
         });
         let text_matches = self.text.as_ref().is_none_or(|q| {
             item.text
@@ -373,10 +382,15 @@ pub fn keep_conversation(item: &mut Conversation, query: &str) -> bool {
     let matched = query.is_empty()
         || address(&item.identifier)
         || hit(&item.name)
-        || item
-            .participants
-            .iter()
-            .any(|p| address(&p.address) || hit(&p.name) || hit(&p.jid) || hit(&p.signal_id));
+        || item.participants.iter().any(|p| {
+            address(&p.address)
+                || hit(&p.name)
+                || p.ids().any(|id| {
+                    // Telegram usernames are written with or without the @.
+                    let id = id.to_lowercase();
+                    id.contains(query) || query.strip_prefix('@').is_some_and(|q| id.contains(q))
+                })
+        });
     if matched {
         item.participants.truncate(MAX_PARTICIPANTS);
     }

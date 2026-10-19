@@ -45,14 +45,19 @@ Run them before every commit, and add a test for every behavior change.
   users and from Contacts; the phone-format tests in `smoke.py` pin what must match.
 - **iMessage queries go through `REAL_MESSAGE`** in `imessage.rs`, which drops reactions and
   events (group changes and the like). WhatsApp and Signal have the equivalent
-  `MESSAGE_FILTER`.
+  `MESSAGE_FILTER`; Telegram has `NAMESPACES` and the `tg_real` SQL function, which drop
+  scheduled and service messages.
 - **Tests pass every store explicitly.** A service reads only the stores enabled with
   `--source`, but an enabled store without its path option reads this Mac's real one.
   `stores()` in `smoke.py` passes a fixture for each, and
   `test_harness_passes_every_store_option` fails if a store is added to `backend.rs`
-  without one there. Signal's fixture is
-  encrypted by `examples/sqlcipher_encrypt.rs`, which `smoke.py` builds, since Python's
-  sqlite3 can't write SQLCipher.
+  without one there. Signal's and Telegram's fixtures are
+  encrypted by `examples/sqlcipher_encrypt.rs`, and Telegram's key file is written by
+  `examples/telegram_tempkey.rs`, which `smoke.py` builds, since Python's sqlite3 can't
+  write SQLCipher. The Telegram fixture encodes Postbox values in Python, independently of
+  the Rust decoder.
+- **Never set SQLCipher `cipher_default_*` pragmas in the service.** They apply to every
+  later connection in the process, so a Telegram setting would break Signal.
 - **The services never show Keychain dialogs** (`disable_keychain_prompts`), so a remote
   call can't hang on one. `msgmcp --check-signal`, run by `reinstall.py`, is where the user
   allows the app to read "Signal Safe Storage".

@@ -3,12 +3,13 @@
 use crate::common::{Contacts, Filter, Listed, Page};
 use crate::types::{Message, Source};
 use crate::whatsapp::AddressBookEntry;
-use crate::{imessage, signal, whatsapp};
+use crate::{imessage, signal, telegram, whatsapp};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 
-/// One store, read-only. Conversation IDs are the store's own; message IDs are integers.
+/// One store, read-only. Conversation and message IDs are the store's own, without the
+/// source prefix.
 pub trait Backend: Send + Sync {
     /// A cheap readability probe, used before skipping the store in "all sources" mode.
     fn check(&self) -> Result<()>;
@@ -32,7 +33,7 @@ pub trait Backend: Send + Sync {
         &self,
         contacts: &Contacts,
         conversation: &str,
-        message: i64,
+        message: &str,
         before: usize,
         after: usize,
     ) -> Result<Vec<Message>>;
@@ -58,7 +59,7 @@ pub struct Store {
 }
 
 /// In `Source` order, which is the order results come in.
-pub const STORES: [Store; 3] = [
+pub const STORES: [Store; 4] = [
     Store {
         source: Source::Imessage,
         option: "--database",
@@ -88,6 +89,16 @@ pub const STORES: [Store; 3] = [
         example_id: "signal:<uuid>",
         numeric_ids: false,
         open: signal::backend,
+    },
+    Store {
+        source: Source::Telegram,
+        option: "--telegram",
+        value: "DIRECTORY",
+        default_path: "Library/Group Containers/6N38VWS5BX.ru.keepcoder.Telegram",
+        names: &["Telegram"],
+        example_id: "telegram:4416",
+        numeric_ids: true,
+        open: telegram::backend,
     },
 ];
 

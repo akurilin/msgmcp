@@ -1,14 +1,15 @@
 # msgmcp
 
 A local MCP server, written in Rust, for message history on a Mac. It reads iMessage
-and SMS from `chat.db`, WhatsApp Desktop from its `ChatStorage.sqlite` and Signal Desktop
-from its encrypted `db.sqlite`, all read-only, looks people up in Contacts and WhatsApp's
-address book, and sends iMessage text through the Messages app.
+and SMS from `chat.db`, WhatsApp Desktop from its `ChatStorage.sqlite`, Signal Desktop
+from its encrypted `db.sqlite` and Telegram for macOS from its encrypted Postbox cache, all
+read-only, looks people up in Contacts and WhatsApp's address book, and sends iMessage text
+through the Messages app.
 
 ## The problem
 
 Agents increasingly run in cloud sandboxes (Claude, Codex, Grok and others), but your
-iMessages, texts, WhatsApp and Signal chats and contacts live on your Mac. Apple offers no API for
+iMessages, texts, WhatsApp, Signal and Telegram chats and contacts live on your Mac. Apple offers no API for
 them; they sit in local databases that only an app with Full Disk Access can read. So an
 agent that could answer "what did Sarah say about Saturday?" or draft a reply has no way
 to see them.
@@ -44,7 +45,7 @@ flowchart LR
       gateway["msgmcp gateway<br/>127.0.0.1:8765/mcp, bearer token"]
       socket["or msgmcp socket<br/>Unix socket, this user only"]
     end
-    stores[("chat.db, ChatStorage.sqlite,<br/>Signal db.sqlite, Contacts")]
+    stores[("chat.db, ChatStorage.sqlite,<br/>Signal db.sqlite, Telegram Postbox,<br/>Contacts")]
     keychain[("Keychain<br/>Signal Safe Storage")]
     messages["Messages app"]
     audit[/"Audit log<br/>~/Library/Logs/msgmcp"/]
@@ -85,8 +86,8 @@ whatsapp --source signal` builds the release binary, installs `~/Applications/ms
 and its LaunchAgent, and checks that the service can read the stores. Each `--source`
 enables one store, and nothing else is read: list only the apps you want agents to see
 (without `--source`, a first install lists the stores it found and stops). The first time,
-grant **msgmcp** Full Disk Access (to read `chat.db` and WhatsApp's group container; Signal
-doesn't need it) and run it again. When it serves Signal, the script also runs
+grant **msgmcp** Full Disk Access (to read `chat.db` and WhatsApp's and Telegram's group
+containers; Signal doesn't need it) and run it again. When it serves Signal, the script also runs
 `msgmcp --check-signal`, and macOS asks once whether msgmcp may use "Signal Safe
 Storage" from the Keychain: choose Always Allow. Signal encrypts its database with a key
 that only that Keychain item unlocks, and the service never shows that dialog itself, so
@@ -190,10 +191,14 @@ every call is in the [audit log](#remote-access).
 
 - **What people text you.** It can steer an agent into leaking what it reads, or, with
   `--allow-send`, texting your contacts. Approving drafts is the agent's rule, not the server's.
-- **WhatsApp and Signal names.** Senders choose their profile names, so a stranger can show
-  up as "Mom".
+- **WhatsApp, Signal and Telegram names.** Senders choose their profile names, so a stranger
+  can show up as "Mom". Telegram chats from strangers you never wrote to are marked
+  `filtered`, but the mark is a heuristic.
 - **Signal's encryption at rest.** Once allowed, msgmcp can read Signal's database key, so
   anything that controls msgmcp can read your Signal history, as with `chat.db`.
+- **Telegram's encryption at rest.** Without a local passcode, Telegram for macOS encrypts
+  its database with a key anyone who can read its group container can unlock, msgmcp
+  included. With Passcode Lock on, msgmcp reports Telegram as unavailable.
 - **Your address book.** `search_contacts` needs a query but returns anyone who matches,
   so an agent can read most of your contacts with a few short queries.
 - **Your accounts.** The agent platform, GitHub and Tailscale can each let someone in.
@@ -205,6 +210,13 @@ This is a proof of concept for the current macOS `chat.db`, WhatsApp Desktop and
 Desktop schemas, which can change without notice. Signal Desktop updates often; msgmcp
 reads only columns and JSON fields that Signal's own queries use. Signal can only be read,
 not sent to.
+
+Telegram support reads the native Telegram for macOS app (App Store or direct download),
+not Telegram Desktop, which keeps no history on disk. Its database is a cache of what the
+app has loaded: older history the app never fetched is missing, and it is only as current
+as the app's last sync. msgmcp decodes Telegram's undocumented Postbox format, following
+Telegram's open-source client; a Telegram update that changes it shows up as
+`decode_failed` messages or an unavailable store.
 
 ## License
 

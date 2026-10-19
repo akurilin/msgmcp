@@ -1,7 +1,8 @@
 //! iMessage/SMS backend: `~/Library/Messages/chat.db` (read-only) and Messages automation.
 use crate::backend::Backend;
 use crate::common::{
-    APPLE_EPOCH, Contacts, Filter, Listed, Page, neighbors, number, open, page, person, probe,
+    APPLE_EPOCH, Contacts, Filter, Listed, Page, message_number, neighbors, number, open, page,
+    person, probe,
 };
 use crate::types::{
     Conversation, Message, Person, SendReceipt, SendStatus, Service, Source, TextStatus,
@@ -49,7 +50,7 @@ impl Backend for Imessage {
         &self,
         contacts: &Contacts,
         conversation: &str,
-        message: i64,
+        message: &str,
         before: usize,
         after: usize,
     ) -> Result<Vec<Message>> {
@@ -57,7 +58,7 @@ impl Backend for Imessage {
             &self.0,
             contacts,
             number(conversation)?,
-            message,
+            message_number(message)?,
             (before, after),
         )
     }

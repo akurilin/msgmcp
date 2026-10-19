@@ -13,6 +13,7 @@ import pathlib
 import select
 import socket
 import sqlite3
+import struct
 import subprocess
 import tempfile
 import time
@@ -24,11 +25,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 BINARY = ROOT / 'target/debug/msgmcp'
 # Built by this script: Python's sqlite3 can't write SQLCipher databases.
 ENCRYPT = ROOT / 'target/debug/examples/sqlcipher_encrypt'
+TEMPKEY = ROOT / 'target/debug/examples/telegram_tempkey'
 TIMEOUT_SECONDS = 10
 SOCKET = pathlib.Path.home() / 'Library/Application Support/MSGMCP/run/service.sock'
 GATEWAY_URL = 'http://127.0.0.1:8765/mcp'
 SCAN_LIMIT = 10_000
-SOURCES = ('imessage', 'whatsapp', 'signal')
+SOURCES = ('imessage', 'whatsapp', 'signal', 'telegram')
 APPLE_EPOCH = 978_307_200
 NANOS_PER_SECOND = 1_000_000_000
 DATE = 800_000_000 * NANOS_PER_SECOND
@@ -54,10 +56,40 @@ SIGNAL_NICK_PERSON = {'address': None, 'signal_id': SIGNAL_NICK_ACI, 'name': 'Ni
                       'ambiguous': False}
 SIGNAL_UNKNOWN_PERSON = {'address': None, 'signal_id': SIGNAL_UNKNOWN_ACI, 'name': None,
                          'ambiguous': False}
+# Telegram for macOS: times are Unix seconds; this is 2025, between Signal's 2023 messages
+# and the other fixtures' 2026 ones.
+TG = 1_750_000_000
+TG_KEY = bytes(range(48))  # SQLCipher key and salt
+TG_ME, TG_MARCO, TG_STRANGER, TG_BOT, TG_JOINED, TG_FRIEND, TG_UNKNOWN, TG_NOBODY = (
+    1000, 1001, 1003, 1004, 1005, 1006, 1007, 1008)
+TG_SERVICE = 777_000
+TG_DIMA_ID = 5_000_000_001  # above 32 bits, so Postbox packs it around the namespace
+
+
+def tg_peer(namespace, id):
+    """A Postbox peer ID: the ID's high bits above a 3-bit namespace, then its low 32 bits."""
+    return ((id >> 32) << 35) | (namespace << 32) | (id & 0xffff_ffff)
+
+
+TG_DIMA = tg_peer(0, TG_DIMA_ID)
+TG_GROUP = tg_peer(1, 77)
+TG_CHANNEL = tg_peer(2, 88)
+TG_MARCO_PERSON = {'address': '+393331234567', 'telegram_id': str(TG_MARCO),
+                   'telegram_username': 'marco_tg', 'name': 'Marco Rossi', 'ambiguous': False}
+TG_DIMA_PERSON = {'address': None, 'telegram_id': str(TG_DIMA_ID), 'name': 'Dima',
+                  'ambiguous': False}
+TG_UNKNOWN_PERSON = {'address': None, 'telegram_id': str(TG_UNKNOWN), 'name': None,
+                     'ambiguous': False}
+TG_CHANNEL_PERSON = {'address': None, 'telegram_id': '88', 'telegram_username': 'pizzanews',
+                     'name': 'Pizza News', 'ambiguous': False}
 
 
 def timestamp(date):
     seconds = APPLE_EPOCH + date // NANOS_PER_SECOND
+    return datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).isoformat()
+
+
+def tg_timestamp(seconds):
     return datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).isoformat()
 
 
@@ -232,6 +264,255 @@ def signal_fixture(directory, data=True, key=SIGNAL_KEY):
     return directory
 
 
+def murmur3(data, seed=0xF7CA7FD2):
+    """MurmurHash3 x86_32 with Telegram's seed, as a signed 32-bit integer."""
+    c1, c2, mask = 0xcc9e2d51, 0x1b873593, 0xffffffff
+    rotl = lambda x, r: ((x << r) | (x >> (32 - r))) & mask
+    h = seed
+    whole = len(data) // 4 * 4
+    for i in range(0, whole, 4):
+        k = rotl(int.from_bytes(data[i:i + 4], 'little') * c1 & mask, 15) * c2 & mask
+        h = (rotl(h ^ k, 13) * 5 + 0xe6546b64) & mask
+    if len(data) > whole:
+        k = int.from_bytes(data[whole:], 'little')
+        h ^= rotl(k * c1 & mask, 15) * c2 & mask
+    h ^= len(data)
+    for shift, factor in ((16, 0x85ebca6b), (13, 0xc2b2ae35)):
+        h = (h ^ (h >> shift)) * factor & mask
+    h ^= h >> 16
+    return h - (1 << 32) if h & 0x80000000 else h
+
+
+# PostboxCoding: each field is a key, a type byte and a little-endian value.
+def pk(key):
+    return bytes([len(key)]) + key.encode()
+
+
+def f_i32(key, value):
+    return pk(key) + b'\x00' + struct.pack('<i', value)
+
+
+def f_i64(key, value):
+    return pk(key) + b'\x01' + struct.pack('<q', value)
+
+
+def f_bool(key, value):
+    return pk(key) + b'\x02' + bytes([value])
+
+
+def f_double(key, value):
+    return pk(key) + b'\x03' + struct.pack('<d', value)
+
+
+def f_str(key, value):
+    data = value.encode()
+    return pk(key) + b'\x04' + struct.pack('<i', len(data)) + data
+
+
+def f_obj(key, type_name, *fields):
+    body = b''.join(fields)
+    return pk(key) + b'\x05' + struct.pack('<ii', murmur3(type_name.encode()), len(body)) + body
+
+
+def f_i32s(key, values):
+    return pk(key) + b'\x06' + struct.pack(f'<i{len(values)}i', len(values), *values)
+
+
+def f_objs(key, items):
+    out = pk(key) + b'\x08' + struct.pack('<i', len(items))
+    for type_name, fields in items:
+        body = b''.join(fields)
+        out += struct.pack('<ii', murmur3(type_name.encode()), len(body)) + body
+    return out
+
+
+def f_bytes(key, value):
+    return pk(key) + b'\x0a' + struct.pack('<i', len(value)) + value
+
+
+def f_nil(key):
+    return pk(key) + b'\x0b'
+
+
+def root(type_name, *fields):
+    return f_obj('_', type_name, *fields)
+
+
+def tg_user(id, first=None, last=None, username=None, phone=None, bot=False, flags=0):
+    fields = [f_i64('i', tg_peer(0, id)), f_i64('ah', 7), f_i32('aht', 0)]
+    fields += [f(k, v) for f, k, v in ((f_str, 'fn', first), (f_str, 'ln', last),
+                                         (f_str, 'un', username), (f_str, 'p', phone)) if v]
+    fields += [f_objs('ph', []),
+               f_obj('bi', 'BotUserInfo', f_i32('f', 0)) if bot else f_nil('bi'),
+               f_nil('ri'), f_i32('fl', flags), f_nil('emjs'), f_objs('uns', []),
+               f_bool('sth', False), f_double('x', 1.5), f_i32s('xs', [1, 2])]
+    return root('TelegramUser', *fields)
+
+
+def tg_media_id(id):
+    return struct.pack('<iq', 0, id)
+
+
+def tg_file(id, *attributes, name=None):
+    items = [('TelegramMediaFileAttribute', [f_i32('t', t)]) for t in attributes]
+    if name:
+        items.append(('TelegramMediaFileAttribute', [f_i32('t', 0), f_str('fn', name)]))
+    return root('TelegramMediaFile', f_bytes('i', tg_media_id(id)), f_str('mt', 'application/pdf'),
+                f_objs('pr', []), f_objs('at', items))
+
+
+def tg_message(text='', incoming=True, author=None, attributes=(), media=(), referenced=(),
+               unique_id=None, forwarded=False):
+    """A t7 value: header, optional fields, author, text, attributes and media."""
+    data_flags, extra = 0, b''
+    if unique_id is not None:
+        data_flags, extra = 1, struct.pack('<q', unique_id)
+    value = b'\x00' + struct.pack('<II', 1, 0) + bytes([data_flags]) + extra
+    value += struct.pack('<II', 4 if incoming else 0, 0)
+    if forwarded:  # author and date, then the source peer
+        value += b'\x02' + struct.pack('<qiq', TG_DIMA, TG - 1000, TG_CHANNEL)
+    else:
+        value += b'\x00'
+    value += b'\x01' + struct.pack('<q', author) if author is not None else b'\x00'
+    data = text.encode()
+    value += struct.pack('<i', len(data)) + data
+    for blobs in (attributes, media):
+        value += struct.pack('<i', len(blobs)) + b''.join(struct.pack('<i', len(b)) + b for b in blobs)
+    value += struct.pack('<i', len(referenced)) + b''.join(struct.pack('<iq', 0, m) for m in referenced)
+    return value
+
+
+def tg_key(peer, ts, id, namespace=0):
+    return struct.pack('>qiii', peer, namespace, ts, id)
+
+
+def tg_reactions(*recent):
+    return root('ReactionsMessageAttribute', f_bool('vl', True), f_bool('tg', False), f_objs('r', []),
+                f_objs('rp', [('ReactionsMessageAttribute.RecentPeer',
+                               [f_str('v', emoji), f_i32('l', 0), f_i32('u', 0), f_i32('my', my),
+                                f_i64('p', peer), f_i32('ts', ts)])
+                              for emoji, my, peer, ts in recent]),
+                f_objs('tp', []))
+
+
+def tg_chat_list(top=None, group=0, pinned=False):
+    """A t8 value: the newest message as (namespace, ID, timestamp), then inclusion."""
+    value = b'\x01' + struct.pack('<iii', 0, *top) if top else b'\x00'
+    return value + b'\x01' + struct.pack('<H', 65534 if pinned else 0) + b'\x00' + struct.pack('<i', group)
+
+
+def tg_read_state(max_read, count, marked=False):
+    return struct.pack('<iib5i', 1, 0, 0, max_read, 0, max_read, count, 1 if marked else 0)
+
+
+TELEGRAM_SCHEMA = '''
+    CREATE TABLE t2 (key INTEGER PRIMARY KEY, value BLOB);
+    CREATE TABLE t6 (key BLOB PRIMARY KEY, value BLOB) WITHOUT ROWID;
+    CREATE TABLE t7 (key BLOB PRIMARY KEY, value BLOB) WITHOUT ROWID;
+    CREATE TABLE t8 (key INTEGER PRIMARY KEY, value BLOB);
+    CREATE TABLE t14 (key INTEGER PRIMARY KEY, value BLOB);
+    CREATE TABLE t16 (key BLOB PRIMARY KEY, value BLOB) WITHOUT ROWID;
+'''
+
+
+def telegram_data(db):
+    """Peers, chats and messages shaped like Telegram for macOS's Postbox."""
+    peers = [
+        (tg_peer(0, TG_ME), tg_user(TG_ME, 'Alex')),
+        (TG_MARCO, tg_user(TG_MARCO, 'Marco', 'TG', 'marco_tg', '393331234567')),
+        (TG_DIMA, tg_user(TG_DIMA_ID, 'Dima')),
+        (TG_STRANGER, tg_user(TG_STRANGER, 'Crypto', 'Support')),
+        (TG_BOT, tg_user(TG_BOT, 'Pizza Bot', username='pizza_bot', bot=True)),
+        (TG_SERVICE, tg_user(TG_SERVICE, 'Telegram')),
+        (TG_JOINED, tg_user(TG_JOINED, 'Joined')),
+        (TG_FRIEND, tg_user(TG_FRIEND, 'Pinned', 'Friend')),
+        (TG_NOBODY, tg_user(TG_NOBODY, 'Nobody')),
+        (TG_GROUP, root('TelegramGroup', f_i64('i', TG_GROUP), f_str('t', 'Founders'),
+                        f_objs('ph', []), f_i32('pc', 3))),
+        (TG_CHANNEL, root('TelegramChannel', f_i64('i', TG_CHANNEL), f_str('t', 'Pizza News'),
+                          f_str('un', 'pizzanews'), f_i32('i.t', 0), f_i32('i.f', 0)))]
+    db.executemany('INSERT INTO t2 VALUES (?,?)', peers)
+    db.executemany('INSERT INTO t16 VALUES (?, x\'\')',
+                   [(struct.pack('>q', p),) for p in (TG_MARCO, TG_DIMA, TG_JOINED, TG_FRIEND, TG_NOBODY)])
+    photo = root('TelegramMediaImage', f_bytes('i', tg_media_id(501)), f_objs('r', []))
+    action = root('TelegramMediaAction', f_i32('_rawValue', 9))
+    me = tg_peer(0, TG_ME)
+    messages = [
+        (TG_MARCO, TG, 1, tg_message('Pizza on Friday?', author=TG_MARCO, attributes=[tg_reactions(
+            ('❤️', 0, TG_MARCO, TG + 6), ('👍', 1, me, TG + 5))])),
+        (TG_MARCO, TG + 60, 2, tg_message('Pizza works', incoming=False, author=me, unique_id=99,
+                                          attributes=[root('ReplyMessageAttribute', f_i64('i', 1 << 32),
+                                                           f_i64('p', TG_MARCO), f_nil('ti'),
+                                                           f_bool('iq', False))])),
+        (TG_MARCO, TG + 120, 3, tg_message(author=TG_MARCO, media=[photo])),
+        # Media stored once in t6, directly and as a pointer to message 3, which embeds it.
+        (TG_MARCO, TG + 180, 4, tg_message(author=TG_MARCO, referenced=[502])),
+        (TG_MARCO, TG + 240, 5, tg_message('Same photo', author=TG_MARCO, referenced=[501])),
+        (TG_MARCO, TG + 300, 6, tg_message(author=TG_MARCO, media=[action])),
+        (TG_DIMA, TG + 400, 1, tg_message('Pizza with Vasili?', author=TG_DIMA)),
+        (TG_DIMA, TG + 500, 2, tg_message('clip', incoming=False, author=me,
+                                          media=[tg_file(503, 4)])),
+        (TG_GROUP, TG + 600, 1, tg_message('Pizza tonight', author=TG_DIMA, forwarded=True)),
+        (TG_GROUP, TG + 650, 2, tg_message(author=TG_UNKNOWN, media=[tg_file(504, 3, 4)])),
+        (TG_GROUP, TG + 700, 3, tg_message('On my way', incoming=False, author=me)),
+        (TG_CHANNEL, TG + 800, 1, tg_message('Channel pizza news', media=[
+            root('TelegramMediaWebpage', f_bytes('i', tg_media_id(505)))])),
+        (TG_STRANGER, TG + 900, 1, tg_message('Crypto pizza opportunity', author=TG_STRANGER)),
+        (TG_BOT, TG + 950, 1, tg_message('Bot says hi', author=TG_BOT)),
+        (TG_SERVICE, TG + 1000, 1, tg_message('Login code', author=TG_SERVICE)),
+        (TG_JOINED, TG + 50, 1, tg_message(author=TG_JOINED, media=[action]))]
+    db.executemany('INSERT INTO t7 VALUES (?,?)',
+                   [(tg_key(peer, ts, id), value) for peer, ts, id, value in messages])
+    # A scheduled message, in namespace 3, is not a sent message.
+    db.execute('INSERT INTO t7 VALUES (?,?)', (tg_key(TG_MARCO, TG + 360, 7, namespace=3),
+                                               tg_message('Scheduled pizza', incoming=False, author=me)))
+    db.executemany('INSERT INTO t6 VALUES (?,?)', [
+        (struct.pack('>iq', 0, 502), b'\x00' + struct.pack('<i', len(f := tg_file(502, name='menu.pdf'))) + f),
+        (struct.pack('>iq', 0, 501), b'\x01' + struct.pack('<qiii', TG_MARCO, 0, 3, TG + 120))])
+    db.executemany('INSERT INTO t8 VALUES (?,?)', [
+        (TG_MARCO, tg_chat_list((6, TG + 300))),
+        (TG_DIMA, tg_chat_list((2, TG + 500), group=1)),
+        (TG_GROUP, tg_chat_list((3, TG + 700))),
+        (TG_CHANNEL, tg_chat_list((1, TG + 800))),
+        (TG_STRANGER, tg_chat_list((1, TG + 900))),
+        (TG_BOT, tg_chat_list((1, TG + 950))),
+        (TG_SERVICE, tg_chat_list((1, TG + 1000))),
+        (TG_JOINED, tg_chat_list((1, TG + 50))),
+        (TG_FRIEND, tg_chat_list(pinned=True)),
+        (TG_NOBODY, tg_chat_list())])
+    db.executemany('INSERT INTO t14 VALUES (?,?)', [
+        (TG_MARCO, tg_read_state(2, 2)), (TG_DIMA, tg_read_state(1, 0, marked=True)),
+        (TG_STRANGER, tg_read_state(0, 1))])
+
+
+_encrypted_telegram = {}
+
+
+def telegram_fixture(directory, data=True, key=TG_KEY, passcode=False):
+    """A Telegram group container: appstore/.tempkeyEncrypted holding the database key,
+    encrypted with the default passcode, and one account's Postbox database. With
+    `passcode`, the key's hash doesn't match, as when a local passcode encrypts it."""
+    if data not in _encrypted_telegram:
+        work = pathlib.Path(tempfile.mkdtemp())
+        try:
+            with sqlite3.connect(work / 'plain.db') as db:
+                db.executescript(TELEGRAM_SCHEMA)
+                if data:
+                    telegram_data(db)
+            db.close()
+            subprocess.run([str(ENCRYPT), work / 'plain.db', work / 'db_sqlite', TG_KEY.hex(),
+                            '--plaintext-header'], check=True)
+            _encrypted_telegram[data] = (work / 'db_sqlite').read_bytes()
+        finally:
+            shutil.rmtree(work)
+    base = directory / 'appstore'
+    (base / 'account-123/postbox/db').mkdir(parents=True)
+    (base / 'account-123/postbox/db/db_sqlite').write_bytes(_encrypted_telegram[data])
+    plain = key + struct.pack('<i', murmur3(key) ^ (1 if passcode else 0)) + bytes(12)
+    subprocess.run([str(TEMPKEY), base / '.tempkeyEncrypted', plain.hex()], check=True)
+    return directory
+
+
 TYPE_CHECKS = {
     'object': lambda v: isinstance(v, dict),
     'array': lambda v: isinstance(v, list),
@@ -386,6 +667,10 @@ def sg(message, chat):
     return (f'signal:{message}', f'signal:{chat}')
 
 
+def tg(message, chat):
+    return (f'telegram:{chat}.0.{message}', f'telegram:{chat}')
+
+
 class EndToEnd(unittest.TestCase):
     """Runs against the socket service; GatewayEndToEnd repeats it against the gateway."""
     TRANSPORT = 'socket'
@@ -440,14 +725,16 @@ class EndToEnd(unittest.TestCase):
         # tests start a client on signal_fixture's data. Tests must never fall back to the
         # real Signal folder.
         self.signal = signal_fixture(self.root / 'signal', data=False)
+        self.telegram = telegram_fixture(self.root / 'telegram', data=False)
         self.client = self.start_client(self.root / 'contacts')
 
-    def stores(self, contacts, whatsapp=None, signal=None, sources=SOURCES):
+    def stores(self, contacts, whatsapp=None, signal=None, sources=SOURCES, telegram=None):
         """Store options for a service: every path is a fixture, never this Mac's own."""
         self.audit_log = self.root / 'logs' / 'audit.log'
         paths = {'imessage': ['--database', str(self.path)],
                  'whatsapp': ['--whatsapp', str(whatsapp or self.whatsapp)],
-                 'signal': ['--signal', str(signal or self.signal)]}
+                 'signal': ['--signal', str(signal or self.signal)],
+                 'telegram': ['--telegram', str(telegram or self.telegram)]}
         return ([arg for source in sources for arg in ('--source', source, *paths[source])]
                 + ['--contacts', str(contacts), '--audit-log', str(self.audit_log)])
 
@@ -471,11 +758,12 @@ class EndToEnd(unittest.TestCase):
                 self.fail('Service startup failed: ' + read())
             time.sleep(0.01)
 
-    def start_client(self, contacts, whatsapp=None, signal=None, sources=SOURCES):
+    def start_client(self, contacts, whatsapp=None, signal=None, sources=SOURCES, telegram=None):
         run = self.root / ('run-' + str(len(list(self.root.glob('run-*')))))
         socket = run / 'service.sock'
         process, read = self.start_service('socket', '--socket', socket,
-                                           *self.stores(contacts, whatsapp, signal, sources))
+                                           *self.stores(contacts, whatsapp, signal, sources,
+                                                        telegram))
         def stop():
             process.terminate()
             process.wait(timeout=TIMEOUT_SECONDS)
@@ -699,6 +987,172 @@ class EndToEnd(unittest.TestCase):
         after = {p.name: p.read_bytes() for p in store.rglob('*') if p.is_file()}
         self.assertEqual({k: after[k] for k in before}, before)
 
+    def telegram_client(self):
+        return self.start_client(self.root / 'contacts',
+                                 telegram=telegram_fixture(self.root / 'telegram-data'))
+
+    def test_telegram_conversations_and_identities(self):
+        client = self.telegram_client()
+        chats = client.pages('list_conversations', 'conversations', source='telegram', limit=2)
+        # Not listed: a chat with only a service message ("joined Telegram") and a contact
+        # never written to. The pinned chat without messages comes last.
+        self.assertEqual([(c['conversation_id'], c['chat_type'], c['name'], c['identifier'])
+                          for c in chats], [
+            (f'telegram:{TG_SERVICE}', 'direct', 'Telegram', str(TG_SERVICE)),
+            (f'telegram:{TG_BOT}', 'direct', 'Pizza Bot', '@pizza_bot'),
+            (f'telegram:{TG_STRANGER}', 'direct', 'Crypto Support', str(TG_STRANGER)),
+            (f'telegram:{TG_CHANNEL}', 'channel', 'Pizza News', '@pizzanews'),
+            (f'telegram:{TG_GROUP}', 'group', 'Founders', None),
+            (f'telegram:{TG_DIMA}', 'direct', 'Dima', str(TG_DIMA_ID)),
+            (f'telegram:{TG_MARCO}', 'direct', 'Marco Rossi', '+393331234567'),
+            (f'telegram:{TG_FRIEND}', 'direct', 'Pinned Friend', str(TG_FRIEND))])
+        service, bot, stranger, channel, group, dima, marco, friend = chats
+        # Service notifications, bots, and strangers never written to are filtered.
+        self.assertEqual([c.get('filtered', False) for c in chats],
+                         [True, True, True, False, False, False, False, False])
+        self.assertEqual(marco['participants'], [TG_MARCO_PERSON])
+        self.assertEqual(dima['participants'], [TG_DIMA_PERSON])
+        # Groups list the people who wrote in the cached messages; channels list nobody.
+        self.assertEqual(group['participants'], [TG_UNKNOWN_PERSON, TG_DIMA_PERSON])
+        self.assertEqual(channel['participants'], [])
+        # The newest message other than service and scheduled messages.
+        self.assertEqual(marco['latest_message_at'], tg_timestamp(TG + 240))
+        self.assertIsNone(friend['latest_message_at'])
+        self.assertEqual([(c['unread_count'], c.get('marked_unread', False), c.get('archived', False))
+                          for c in (stranger, dima, marco)],
+                         [(1, False, False), (1, True, True), (2, False, False)])
+        for query, expected in [('marco_tg', [TG_MARCO]), ('@marco_tg', [TG_MARCO]),
+                                ('333 123', [TG_MARCO]), ('dima', [TG_GROUP, TG_DIMA]),
+                                (str(TG_DIMA_ID), [TG_GROUP, TG_DIMA]), ('pizzanews', [TG_CHANNEL])]:
+            with self.subTest(query=query):
+                found = client.tool('list_conversations', source='telegram', query=query)
+                self.assertEqual([c['conversation_id'] for c in found['conversations']],
+                                 [f'telegram:{c}' for c in expected])
+        # unread_only skips archived and filtered chats unless asked.
+        unread = client.tool('list_conversations', source='telegram', unread_only=True)
+        self.assertEqual([c['conversation_id'] for c in unread['conversations']],
+                         [f'telegram:{TG_MARCO}'])
+        unread = client.tool('list_conversations', source='telegram', unread_only=True,
+                             include_archived=True, include_filtered=True)
+        self.assertEqual([c['conversation_id'] for c in unread['conversations']],
+                         [f'telegram:{c}' for c in (TG_STRANGER, TG_DIMA, TG_MARCO)])
+        # Telegram's 2025 messages sort after the other fixtures' 2026 ones.
+        merged = client.pages('list_conversations', 'conversations', limit=3)
+        sources = [c['source'] for c in merged if c['latest_message_at']]
+        self.assertEqual(sources[-7:], ['telegram'] * 7)
+        self.assertNotIn('telegram', sources[:-7])
+
+    def test_telegram_read_kinds_replies_reactions_and_context(self):
+        client = self.telegram_client()
+        messages = client.pages('read_conversation', 'messages',
+                                conversation_id=f'telegram:{TG_MARCO}', limit=2)
+        # Not the pinned-message event (6) or the scheduled message.
+        self.assertEqual(self.ids(messages), [tg(i, TG_MARCO) for i in (1, 2, 3, 4, 5)])
+        self.assertEqual([(m['kind'], m['text'], m['text_status']) for m in messages], [
+            ('text', 'Pizza on Friday?', 'ok'), ('text', 'Pizza works', 'ok'),
+            ('image', None, 'no_text'), ('document', 'menu.pdf', 'ok'),
+            ('image', 'Same photo', 'ok')])
+        self.assertEqual([m['guid'] for m in messages], ['1', '2', '3', '4', '5'])
+        self.assertEqual([m.get('is_read') for m in messages], [True, None, False, False, False])
+        self.assertEqual(messages[0]['sender'], TG_MARCO_PERSON)
+        self.assertEqual(messages[0]['sent_at'], tg_timestamp(TG))
+        self.assertEqual((messages[1]['sender'], messages[1]['is_from_me']), (ME, True))
+        self.assertEqual(messages[1]['reply_to_guid'], '1')
+        self.assertEqual(messages[0]['reactions'], [
+            {'emoji': '👍', 'is_from_me': True, 'sender': ME},
+            {'emoji': '❤️', 'is_from_me': False, 'sender': TG_MARCO_PERSON}])
+        self.assertTrue(all('reactions' not in m for m in messages[1:]))
+        latest = client.tool('read_conversation', conversation_id=f'telegram:{TG_MARCO}',
+                             order='newest_first', limit=2)
+        self.assertEqual(self.ids(latest['messages']), [tg(5, TG_MARCO), tg(4, TG_MARCO)])
+        dima = client.tool('read_conversation', conversation_id=f'telegram:{TG_DIMA}')['messages']
+        self.assertEqual([(m['kind'], m['text']) for m in dima], [('text', 'Pizza with Vasili?'),
+                                                                 ('video', 'clip')])
+        group = client.tool('read_conversation', conversation_id=f'telegram:{TG_GROUP}')['messages']
+        self.assertEqual([(m['kind'], m['sender']) for m in group], [
+            ('text', TG_DIMA_PERSON), ('gif', TG_UNKNOWN_PERSON), ('text', ME)])
+        channel = client.tool('read_conversation', conversation_id=f'telegram:{TG_CHANNEL}')['messages']
+        self.assertEqual([(m['kind'], m['sender']) for m in channel], [('link', TG_CHANNEL_PERSON)])
+        context = client.tool('get_message_context', conversation_id=f'telegram:{TG_MARCO}',
+                              message_id=f'telegram:{TG_MARCO}.0.4', before=1, after=1)
+        self.assertEqual(self.ids(context['messages']), [tg(i, TG_MARCO) for i in (3, 4, 5)])
+
+    def test_telegram_search_and_senders(self):
+        client = self.telegram_client()
+        pizza = client.pages('search_messages', 'messages', text='PIZZA', source='telegram', limit=2)
+        # In time order across chats; not the scheduled message.
+        self.assertEqual(self.ids(pizza), [tg(1, TG_MARCO), tg(2, TG_MARCO), tg(1, TG_DIMA),
+                                           tg(1, TG_GROUP), tg(1, TG_CHANNEL), tg(1, TG_STRANGER)])
+        latest = client.tool('search_messages', text='pizza', source='telegram',
+                             order='newest_first', limit=2)
+        self.assertEqual(self.ids(latest['messages']), [tg(1, TG_STRANGER), tg(1, TG_CHANNEL)])
+        for sender, expected in [('Marco', [tg(1, TG_MARCO)]), ('+39 333 123 4567', [tg(1, TG_MARCO)]),
+                                 ('@marco_tg', [tg(1, TG_MARCO)]), ('me', [tg(2, TG_MARCO)]),
+                                 (str(TG_DIMA_ID), [tg(1, TG_DIMA), tg(1, TG_GROUP)])]:
+            with self.subTest(sender=sender):
+                found = client.tool('search_messages', text='pizza', source='telegram', sender=sender)
+                self.assertEqual(self.ids(found['messages']), expected)
+        between = client.tool('search_messages', text='pizza', source='telegram',
+                              after=tg_timestamp(TG + 60), before=tg_timestamp(TG + 600))
+        self.assertEqual(self.ids(between['messages']), [tg(2, TG_MARCO), tg(1, TG_DIMA)])
+        everything = client.tool('search_messages', text='pizza', limit=200)['messages']
+        self.assertEqual(self.ids(everything)[-6:], self.ids(pizza))
+
+    def test_telegram_errors(self):
+        client = self.telegram_client()
+        cases = [
+            ('read_conversation', {'conversation_id': 'telegram:999'}, 'Unknown conversation ID'),
+            ('read_conversation', {'conversation_id': 'telegram:abc'}, 'Invalid ID'),
+            ('read_conversation', {'conversation_id': f'telegram:{TG_MARCO}', 'cursor': 'telegram:zz'}, 'Invalid cursor'),
+            ('get_message_context', {'conversation_id': f'telegram:{TG_MARCO}', 'message_id': f'telegram:{TG_MARCO}.0.6'}, 'Message not found'),
+            ('get_message_context', {'conversation_id': f'telegram:{TG_MARCO}', 'message_id': f'telegram:{TG_MARCO}.3.7'}, 'Message not found'),
+            ('get_message_context', {'conversation_id': f'telegram:{TG_DIMA}', 'message_id': f'telegram:{TG_MARCO}.0.1'}, 'Message not found'),
+            ('get_message_context', {'conversation_id': f'telegram:{TG_MARCO}', 'message_id': 'telegram:abc'}, 'Message not found')]
+        for name, arguments, expected in cases:
+            with self.subTest(tool=name, arguments=arguments):
+                result = client.request('tools/call', {'name': name, 'arguments': arguments})
+                self.assertTrue(result['isError'])
+                self.assertIn(expected, result['content'][0]['text'])
+
+    def test_signal_and_telegram_together(self):
+        # Both are SQLCipher databases with different settings, read in one process.
+        client = self.start_client(self.root / 'contacts',
+                                   signal=signal_fixture(self.root / 'signal-data'),
+                                   telegram=telegram_fixture(self.root / 'telegram-data'))
+        for _ in range(2):
+            chats = client.tool('list_conversations', limit=200)
+            self.assertNotIn('unavailable_sources', chats)
+            self.assertEqual({c['source'] for c in chats['conversations']},
+                             {'imessage', 'whatsapp', 'signal', 'telegram'})
+
+    def test_unreadable_telegram_store_is_reported(self):
+        locked = telegram_fixture(self.root / 'telegram-locked', passcode=True)
+        wrong_key = telegram_fixture(self.root / 'telegram-wrong-key', key=bytes(48))
+        for telegram, error in [(self.root / 'no-telegram', 'Telegram database not found'),
+                                (locked, 'locked with a passcode'),
+                                (wrong_key, 'did not open its database')]:
+            with self.subTest(error=error):
+                client = self.start_client(self.root / 'contacts', telegram=telegram)
+                chats = client.tool('list_conversations')
+                self.assertEqual([u['source'] for u in chats['unavailable_sources']], ['telegram'])
+                self.assertIn(error, chats['unavailable_sources'][0]['error'])
+                result = client.request('tools/call', {'name': 'list_conversations',
+                                                       'arguments': {'source': 'telegram'}})
+                self.assertTrue(result['isError'])
+                self.assertIn(error, result['content'][0]['text'])
+
+    def test_telegram_store_is_not_modified(self):
+        client = self.telegram_client()
+        store = self.root / 'telegram-data'
+        before = {p: p.read_bytes() for p in store.rglob('*') if p.is_file()}
+        client.tool('list_conversations')
+        client.tool('search_messages', text='pizza')
+        client.tool('read_conversation', conversation_id=f'telegram:{TG_MARCO}')
+        client.tool('get_message_context', conversation_id=f'telegram:{TG_MARCO}',
+                    message_id=f'telegram:{TG_MARCO}.0.2')
+        after = {p: p.read_bytes() for p in store.rglob('*') if p.is_file()}
+        self.assertEqual({k: after[k] for k in before}, before)
+
     def test_only_enabled_sources_are_read(self):
         client = self.start_client(self.root / 'contacts', sources=('imessage',))
         chats = client.tool('list_conversations')
@@ -742,7 +1196,7 @@ class EndToEnd(unittest.TestCase):
     def test_service_options_are_checked(self):
         cases = [
             (['socket'], 'Choose the message stores to serve with --source'),
-            (['socket', '--source', 'telegram'], 'Unknown source "telegram"'),
+            (['socket', '--source', 'telegraph'], 'Unknown source "telegraph"'),
             (['socket', '--source', 'imessage', '--signal', self.root / 'signal'],
              '--signal requires --source signal'),
             (['gateway', '--source', 'whatsapp', '--allow-send'],
@@ -836,7 +1290,7 @@ class EndToEnd(unittest.TestCase):
         send = next(t for t in tools if t['name'] == 'send_message')
         self.assertFalse(send['annotations']['readOnlyHint'])
         self.assertFalse(send['annotations']['idempotentHint'])
-        self.assertIn('iMessage, SMS, WhatsApp and Signal', self.client.initialized['instructions'])
+        self.assertIn('iMessage, SMS, WhatsApp, Signal and Telegram', self.client.initialized['instructions'])
         self.assertTrue(all(t['inputSchema']['type'] == 'object' for t in tools))
         self.assertTrue(all(t['outputSchema']['type'] == 'object' for t in tools))
         self.assertEqual(self.client.initialized['serverInfo']['name'], 'msgmcp')
@@ -1221,7 +1675,7 @@ class EndToEnd(unittest.TestCase):
             ('read_conversation', {'conversation_id': 'imessage:1', 'cursor': 'bad'}, 'Invalid cursor'),
             ('read_conversation', {'conversation_id': 'imessage:1', 'order': 'sideways'}, 'unknown variant'),
             ('list_conversations', {'cursor': 'bad'}, 'Invalid cursor'),
-            ('list_conversations', {'cursor': '1:telegram:1'}, 'Invalid cursor'),
+            ('list_conversations', {'cursor': '1:telegraph:1'}, 'Invalid cursor'),
             ('list_conversations', {'active_after': 'yesterday'}, 'RFC 3339'),
             ('read_conversation', {'conversation_id': 'whatsapp:1', 'cursor': 'whatsapp:x:1'}, 'Invalid cursor'),
             ('search_messages', {'text': 'x', 'source': 'imessage', 'cursor': 'whatsapp:'}, 'Cursor does not match'),
@@ -1302,11 +1756,12 @@ class EndToEnd(unittest.TestCase):
 class GatewayEndToEnd(EndToEnd):
     TRANSPORT = 'gateway'
 
-    def start_gateway(self, contacts, whatsapp=None, *options, signal=None, sources=SOURCES):
+    def start_gateway(self, contacts, whatsapp=None, *options, signal=None, sources=SOURCES,
+                      telegram=None):
         self.token_file = self.root / 'gateway' / 'token'
         process, read = self.start_service(
             'gateway', '--listen', '127.0.0.1:0', '--token-file', self.token_file,
-            *options, *self.stores(contacts, whatsapp, signal, sources))
+            *options, *self.stores(contacts, whatsapp, signal, sources, telegram))
         def stop():
             process.terminate()
             self.assertEqual(process.wait(timeout=TIMEOUT_SECONDS), 0, read())
@@ -1315,12 +1770,12 @@ class GatewayEndToEnd(EndToEnd):
         url = read().split('listening on ', 1)[1].split()[0]
         return process, url
 
-    def start_client(self, contacts, whatsapp=None, signal=None, sources=SOURCES):
+    def start_client(self, contacts, whatsapp=None, signal=None, sources=SOURCES, telegram=None):
         # The socket suite exercises send_message's schema, so offer it here too; only
         # iMessage can send.
         send = ['--allow-send'] if 'imessage' in sources else []
         process, self.url = self.start_gateway(contacts, whatsapp, *send, signal=signal,
-                                               sources=sources)
+                                               sources=sources, telegram=telegram)
         self.assertEqual(self.token_file.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.token_file.parent.stat().st_mode & 0o777, 0o700)
         self.token = self.token_file.read_text().strip()
@@ -1490,7 +1945,9 @@ if __name__ == '__main__':
                              'the installed service (default: gateway)')
     args = parser.parse_args()
     BINARY = args.binary.resolve()
-    subprocess.run(['cargo', 'build', '--quiet', '--example', ENCRYPT.name], cwd=ROOT, check=True)
+    for example in (ENCRYPT, TEMPKEY):
+        subprocess.run(['cargo', 'build', '--quiet', '--example', example.name], cwd=ROOT,
+                       check=True)
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case)
                                for case in (EndToEnd, GatewayEndToEnd, AgentScript))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
