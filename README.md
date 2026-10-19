@@ -4,6 +4,31 @@ A local MCP server, written in Rust, for message history on a Mac. It reads iMes
 and SMS from `chat.db` and WhatsApp Desktop from its `ChatStorage.sqlite`, both
 read-only, and sends iMessage text through the Messages app.
 
+## The problem
+
+Agents increasingly run in cloud sandboxes (Claude, Codex, Grok and others), but your
+iMessages, texts, WhatsApp chats and contacts live on your Mac. Apple offers no API for
+them; they sit in local databases that only an app with Full Disk Access can read. So an
+agent that could answer "what did Sarah say about Saturday?" or draft a reply has no way
+to see them.
+
+The obvious ways to bridge that gap are unsafe:
+
+- **Uploading the databases** hands over every conversation you've ever had, to keep
+  somewhere you don't control.
+- **Opening the Mac to the agent**, through SSH or an exposed port, gives it far more than
+  your messages, and anything that hijacks the agent gets the same.
+- **Letting it send freely** means a stranger's message, read by the agent, can steer it
+  into texting anyone.
+
+msgmcp gives a cloud agent a narrow door instead. One signed app on the Mac holds the
+permissions and offers a few tools: search, list and read conversations, and send an
+iMessage. Agents reach it only over your private Tailscale network, where they're tagged
+and limited to that one port, and every request needs a token. The databases are opened
+read-only, results carry names from your Contacts, sending is off for remote agents
+unless you enable it and then reaches only people saved in Contacts, and every call lands in an audit log on the Mac. [Security](#security) lists
+what this keeps out and what it doesn't.
+
 ## Architecture
 
 ```mermaid
