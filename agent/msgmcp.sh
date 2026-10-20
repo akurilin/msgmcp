@@ -76,6 +76,13 @@ msgmcp_rpc() {
     -d "$1"
 }
 
+# POST without the token and print the HTTP status, which should be 401. The header tells
+# the gateway this is a check, so its audit log shows a self-test rather than a stranger.
+msgmcp_probe() {
+  curl -s -o /dev/null -w '%{http_code}' --max-time 30 --proxy "$TS_PROXY" "$MSGMCP_URL" \
+    -H 'X-Msgmcp-Probe: auth-check' -H 'Content-Type: application/json' -d '{}'
+}
+
 # Call one tool: msgmcp TOOL '{"arg": "value"}'. The answer is in .result.structuredContent;
 # .result.isError true means the tool failed and .result.content[0].text says why.
 msgmcp() {
@@ -101,8 +108,7 @@ msgmcp_test() {
   else
     fail "this node is not tagged tag:agent, so the tailnet policy does not restrict it"
   fi
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 --proxy "$TS_PROXY" "$MSGMCP_URL" \
-    -H 'Content-Type: application/json' -d '{}')
+  code=$(msgmcp_probe)
   if [ "$code" = 401 ]; then pass "gateway reachable; it refuses requests without the token"; else fail "expected HTTP 401 without a token, got $code"; fi
   out=$(msgmcp_rpc '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
   for tool in list_conversations search_messages read_conversation get_message_context; do

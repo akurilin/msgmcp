@@ -30,6 +30,10 @@ pub const MCP_PATH: &str = "/mcp";
 const TOKEN_BYTES: usize = 32;
 const TOKEN_DIRECTORY_MODE: u32 = 0o700;
 const TOKEN_FILE_MODE: u32 = 0o600;
+/// Sent by a caller checking that the gateway refuses it, such as `msgmcp_test` in
+/// `agent/msgmcp.sh`. A refused request with it is logged with `"probe": true`. Anyone can
+/// send it, so it labels a rejection but never hides one.
+const PROBE_HEADER: &str = "x-msgmcp-probe";
 
 pub struct Options {
     pub listen: String,
@@ -126,11 +130,13 @@ async fn authorize(State(token): State<Arc<str>>, mut request: Request, next: Ne
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
+    let probe = request.headers().contains_key(PROBE_HEADER);
     let rejected = |reason: &str, status: StatusCode| {
-        audit::record(
-            "rejected",
-            json!({"reason": reason, "status": status.as_u16(), "caller": caller}),
-        );
+        let mut event = json!({"reason": reason, "status": status.as_u16(), "caller": caller});
+        if probe {
+            event["probe"] = json!(true);
+        }
+        audit::record("rejected", event);
     };
     if presented.is_some_and(|p| same(p.as_bytes(), token.as_bytes())) {
         // Host and Origin checks happen inside the MCP service; log what they refuse.

@@ -2083,6 +2083,21 @@ class GatewayEndToEnd(EndToEnd):
         self.assertEqual(refused.returncode, 1)
         self.assertIn('Cannot connect to MSGMCP', refused.stderr)
 
+    def test_agent_probe_is_logged_as_a_self_test(self):
+        # msgmcp_probe as msgmcp_test runs it, minus the tailnet proxy (an empty one is none).
+        env = {'PATH': os.environ['PATH'], 'HOME': os.environ['HOME'], 'MSGMCP_URL': self.url}
+        result = subprocess.run(['bash', '-c', 'source agent/msgmcp.sh && TS_PROXY= msgmcp_probe'],
+                                cwd=ROOT, env=env, capture_output=True, text=True,
+                                timeout=TIMEOUT_SECONDS)
+        self.assertEqual((result.returncode, result.stdout), (0, '401'))
+        self.assertEqual(self.post({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})[0], 401)
+        # The header labels a rejection; it never lets a request through.
+        listing = {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}
+        self.assertEqual(self.post(listing, 'x' * len(self.token), **{'X-Msgmcp-Probe': '1'})[0], 401)
+        rejected = [(e['reason'], e.get('probe')) for e in self.audit() if e['event'] == 'rejected']
+        self.assertEqual(rejected, [('missing token', True), ('missing token', None),
+                                    ('wrong token', True)])
+
     def test_caller_from_forwarded_for(self):
         # Behind tailscale serve the tailnet address is the last X-Forwarded-For entry;
         # anything before it was sent by the client.

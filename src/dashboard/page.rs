@@ -1022,6 +1022,13 @@ fn event_row(out: &mut String, e: &Ev, now: DateTime<Local>) {
     if let Some(reason) = str_of(e.raw, "reason") {
         let _ = write!(badge, "<span class=\"reason\">{}</span>", esc(reason));
     }
+    // The caller's own word, unverified: a label on the rejection, still counted as one.
+    if e.raw.get("probe").and_then(Value::as_bool) == Some(true) {
+        badge.push_str(
+            "<span class=\"reason\" title=\"The caller marked this request as a check \
+             that the gateway refuses it. Any caller can send that mark.\">self-test</span>",
+        );
+    }
     if let Some(error) = e.raw.get("error").filter(|v| !v.is_null()) {
         let _ = write!(
             badge,
@@ -1493,6 +1500,37 @@ mod tests {
         assert!(with.contains("Only the newest 6 events are loaded"));
         let without = render(&status(), &events, false, &[], now);
         assert!(!without.contains("are loaded"));
+    }
+
+    #[test]
+    fn probes_are_labeled_and_still_counted_as_rejections() {
+        let now = Local::now();
+        let rejected = |minutes, probe: Option<bool>| {
+            let mut e = json!({"time": at(now, minutes), "transport":"gateway","event":"rejected",
+                "reason":"missing token","status":401,"caller":{"ip":"100.64.0.10"}});
+            if let Some(probe) = probe {
+                e["probe"] = json!(probe);
+            }
+            e
+        };
+        let events = [
+            rejected(1, Some(true)),
+            rejected(2, None),
+            rejected(3, Some(false)),
+        ];
+        let html = render(&status(), &events, false, &[], now);
+        assert_eq!(html.matches(">self-test</span>").count(), 1);
+        assert!(html.contains(
+            "<span class=\"reason\">missing token</span><span class=\"reason\" title=\"The caller marked"
+        ));
+        let html = render(
+            &status(),
+            &events,
+            false,
+            &q(&[("outcome", "rejected")]),
+            now,
+        );
+        assert!(html.contains("3 of 3 events"));
     }
 
     #[test]

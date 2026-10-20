@@ -148,7 +148,7 @@ Add `--allow-send` if the user chose it in step 4. Passing any of these options 
 the installed set, so give every option you want each time you change one.
 
 ```sh
-curl -s -o /dev/null -w '%{http_code}\n' https://<mac>/mcp -H 'Content-Type: application/json' -d '{}'
+curl -s -o /dev/null -w '%{http_code}\n' https://<mac>/mcp -H 'X-Msgmcp-Probe: auth-check' -H 'Content-Type: application/json' -d '{}'
 "$HOME/Applications/msgmcp.app/Contents/MacOS/msgmcp" schema --url https://<mac>/mcp >/dev/null && echo ok
 ```
 

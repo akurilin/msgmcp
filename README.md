@@ -173,7 +173,9 @@ means submitted, not delivered; never retry a send automatically.
 **Audit log.** Both services append one JSON line per tool call to
 `~/Library/Logs/msgmcp/audit.log` (Console.app shows it under Log Reports): the time,
 service, caller, tool, arguments, outcome and any error. The gateway also logs requests it
-refuses. Sent message text is logged as an argument; what tools return is never logged. The
+refuses, with `"probe": true` when the caller sent `X-Msgmcp-Probe` to say it was checking
+that a request without the token is refused, as `msgmcp_test` does; the dashboard labels
+those "self-test" but still counts them as rejections, since any caller can send the header. Sent message text is logged as an argument; what tools return is never logged. The
 log rotates at 10 MB and keeps five old files.
 
 The caller is the tailnet device behind the gateway (its address, name, and tags or owner,
