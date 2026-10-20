@@ -565,6 +565,13 @@ def validate(value, schema, defs, path='$'):
             validate(item, schema['items'], defs, f'{path}[{index}]')
 
 
+def listening(name, log):
+    """The URL in a service's "<name> listening on URL" line, or None until the line is
+    whole: stderr is unbuffered, so a reader can catch it half written."""
+    found = re.search(rf'{name} listening on (\S+)\n', log)
+    return found and found.group(1)
+
+
 class Client:
     def __init__(self, *args):
         self.stderr = tempfile.TemporaryFile()
@@ -1618,10 +1625,19 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.audit_log.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.audit_log.parent.stat().st_mode & 0o777, 0o700)
 
+    def dashboard_url(self):
+        """The dashboard of the service started last, once it has printed the whole line."""
+        deadline = time.monotonic() + TIMEOUT_SECONDS
+        while not (url := listening('dashboard', self.read_service_log())):
+            if time.monotonic() >= deadline:
+                self.fail('No dashboard address: ' + self.read_service_log())
+            time.sleep(0.01)
+        return url
+
     def dashboard(self, path, **headers):
         """GET from the dashboard of the service started last: status, headers, body."""
-        url = re.search(r'dashboard listening on (\S+)/', self.read_service_log()).group(1)
-        request = urllib.request.Request(url + path, headers=headers)
+        url = self.dashboard_url()
+        request = urllib.request.Request(url + path.lstrip('/'), headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
                 return response.status, response.headers, response.read()
@@ -1703,8 +1719,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(events, self.audit()[::-1] + [older])
 
     def test_dashboard_refuses_other_hosts(self):
-        port = re.search(r'dashboard listening on http://127\.0\.0\.1:(\d+)/',
-                         self.read_service_log()).group(1)
+        port = re.fullmatch(r'http://127\.0\.0\.1:(\d+)/', self.dashboard_url()).group(1)
         self.assertEqual(self.dashboard('/api/status', Host=f'localhost:{port}')[0], 200)
         # A page that rebinds its own domain to 127.0.0.1 sends its domain as the Host.
         for host in (f'rebind.example:{port}', 'localhost', f'localhost:{int(port) + 1}'):
@@ -2016,9 +2031,8 @@ class GatewayEndToEnd(EndToEnd):
             process.terminate()
             self.assertEqual(process.wait(timeout=TIMEOUT_SECONDS), 0, read())
         self.addCleanup(stop)
-        self.wait_for(process, read, lambda: 'gateway listening on' in read())
-        url = read().split('gateway listening on ', 1)[1].split()[0]
-        return process, url
+        self.wait_for(process, read, lambda: listening('gateway', read()))
+        return process, listening('gateway', read())
 
     def start_client(self, contacts, whatsapp=None, signal=None, sources=SOURCES, telegram=None):
         # The socket suite exercises send_message's schema, so offer it here too; only
