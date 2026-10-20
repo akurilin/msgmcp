@@ -35,6 +35,7 @@ Each shell command needs `source agent/msgmcp.sh` first. Then call tools like th
 
     msgmcp list_conversations '{"query": "sarah"}'
     msgmcp read_conversation '{"conversation_id": "imessage:2771", "order": "newest_first", "limit": 20}'
+    msgmcp read_conversations '{"conversation_ids": ["imessage:2771", "whatsapp:45"], "limit": 10}'
     msgmcp search_messages '{"text": "dinner", "after": "2026-10-01T00:00:00Z"}'
     msgmcp get_message_context '{"conversation_id": "whatsapp:45", "message_id": "whatsapp:123"}'
     msgmcp search_contacts '{"query": "sarah"}'
@@ -54,8 +55,13 @@ failed and `.result.content[0].text` says why.
   search_contacts with their name. Each name says whether it came from macOS Contacts,
   WhatsApp's address book, Signal conversations or the user's Telegram contacts. Signal
   and Telegram may hide phone numbers; `signal_ids` and `telegram_ids` match message senders.
-- For recent activity: list_conversations with `active_after`, then read_conversation
-  with `order: "newest_first"` and a small `limit`.
+- For recent activity: list_conversations with `active_after`, then read_conversations
+  for several IDs or read_conversation for one ID. Batch reads return up to 20 messages
+  for each of up to 50 IDs, newest first by default. A bad ID has its own error.
+  Use each page's `next_cursor` with read_conversation to get more messages.
+- For one recent chat, use `order: "newest_first"` and a small `limit`.
+  read_conversation otherwise starts with the oldest messages.
+- Reuse an identical read result in the same task when you do not need new data.
 - For what the user hasn't read: list_conversations with `"unread_only": true`. Like the
   apps' unread views, it skips archived chats and filtered iMessage and Telegram chats
   (unknown senders, automated senders, junk); add `"include_archived": true` or

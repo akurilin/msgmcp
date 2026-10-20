@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use backend::{Backend, STORES, and_list, store};
 use client::Endpoint;
 use common::{
-    Filter, MAX_CONTEXT, SCAN_LIMIT, e164, is_contact, keep_conversation, limit,
+    Contacts, Filter, MAX_CONTEXT, SCAN_LIMIT, e164, is_contact, keep_conversation, limit,
     load_contact_records, load_contacts, parse_time,
 };
 use rmcp::{
@@ -35,9 +35,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command, sync::Arc};
 use types::{
-    ALL_SOURCES, ContactList, ConversationList, MessageContext, MessageList, SendReceipt, Source,
-    Unavailable,
+    ALL_SOURCES, BatchConversationItem, BatchConversationList, ContactList, ConversationList,
+    MessageContext, MessageList, SendReceipt, Source, Unavailable,
 };
+
+const MAX_BATCH_CONVERSATIONS: usize = 50;
+const MAX_BATCH_PAGE_SIZE: usize = 20;
+const DEFAULT_BATCH_PAGE_SIZE: usize = 10;
 
 /// "imessage, whatsapp or signal".
 fn source_names(sources: &[Source], last: &str) -> String {
@@ -172,6 +176,17 @@ struct Messages {
     limit: Option<usize>,
     /// Opaque continuation cursor from the previous response.
     cursor: Option<String>,
+}
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct BatchConversations {
+    /// Source-qualified conversation IDs from list_conversations, 1 to 50. Each ID must
+    /// be unique. Results keep this order.
+    conversation_ids: Vec<String>,
+    /// Messages per conversation, 1 to 20; default 10. For longer pages use
+    /// read_conversation.
+    limit: Option<usize>,
+    /// Order within each conversation; default newest_first.
+    order: Option<MessageOrder>,
 }
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct ContextRequest {
@@ -563,6 +578,71 @@ impl Server {
         self.messages(p, false, &extensions).await
     }
     #[tool(
+        output_schema = output_schema::<BatchConversationList>(),
+        annotations(read_only_hint = true),
+        description = "Read the first page of several conversations in one call. Supply 1 to 50 unique conversation_ids from list_conversations. Returns one result per ID in request order, with a page or an error. Default: 10 newest messages per conversation; limit can be 1 to 20. For more messages, pass a page's next_cursor to read_conversation with the same ID, limit and order."
+    )]
+    async fn read_conversations(
+        &self,
+        Parameters(p): Parameters<BatchConversations>,
+        extensions: Extensions,
+    ) -> Result<Json<BatchConversationList>, String> {
+        self.run(
+            "read_conversations",
+            audit_arguments(&p),
+            &extensions,
+            move |stores| {
+                let cap = p.limit.unwrap_or(DEFAULT_BATCH_PAGE_SIZE);
+                if p.conversation_ids.is_empty()
+                    || p.conversation_ids.len() > MAX_BATCH_CONVERSATIONS
+                {
+                    bail!("conversation_ids must have 1 to {MAX_BATCH_CONVERSATIONS} IDs")
+                }
+                if !(1..=MAX_BATCH_PAGE_SIZE).contains(&cap) {
+                    bail!("limit must be 1 to {MAX_BATCH_PAGE_SIZE}")
+                }
+                let unique: std::collections::HashSet<_> = p.conversation_ids.iter().collect();
+                if unique.len() != p.conversation_ids.len() {
+                    bail!("conversation_ids must be unique")
+                }
+                // Load Contacts once, then isolate a bad ID or store to its own result.
+                let (contacts, readable) = load_contacts(&stores.contacts);
+                let order = p.order.unwrap_or(MessageOrder::NewestFirst);
+                let results = p
+                    .conversation_ids
+                    .into_iter()
+                    .map(|conversation_id| {
+                        let request = Messages {
+                            conversation_id: Some(conversation_id.clone()),
+                            source: None,
+                            text: None,
+                            sender: None,
+                            after: None,
+                            before: None,
+                            order: Some(order),
+                            limit: Some(cap),
+                            cursor: None,
+                        };
+                        match fetch_messages(stores, request, false, &contacts, readable) {
+                            Ok(page) => BatchConversationItem {
+                                conversation_id,
+                                page: Some(page),
+                                error: None,
+                            },
+                            Err(error) => BatchConversationItem {
+                                conversation_id,
+                                page: None,
+                                error: Some(format!("{error:#}")),
+                            },
+                        }
+                    })
+                    .collect();
+                Ok(BatchConversationList { results })
+            },
+        )
+        .await
+    }
+    #[tool(
         output_schema = output_schema::<ContactList>(),
         annotations(read_only_hint = true),
         description = "Look up people in macOS Contacts, WhatsApp's address book, Signal conversations and Telegram contacts by name, phone number, email address, WhatsApp JID, Signal ID, Telegram ID or Telegram @username; a query is required. Entries that share a phone number, email address or app ID are merged into one person. Each name carries its source (contacts, whatsapp, signal or telegram). Use it to find someone's number or email for send_message (in_contacts must be true), or addresses and IDs for list_conversations."
@@ -672,71 +752,81 @@ impl Server {
             "read_conversation"
         };
         self.run(tool, audit_arguments(&p), extensions, move |stores| {
-            let cap = limit(p.limit)?;
-            if search && p.text.as_deref().is_none_or(|t| t.trim().is_empty()) {
-                bail!("text is required and must not be empty")
-            }
-            if !search && p.conversation_id.is_none() {
-                bail!("conversation_id is required")
-            }
-            let (order, conversation, explicit) =
-                plan(stores, p.source, p.conversation_id.as_deref())?;
-            let filter = Filter {
-                conversation,
-                after: parse_time(p.after.as_deref())?,
-                before: parse_time(p.before.as_deref())?,
-                text: p.text.map(|x| x.to_lowercase()),
-                sender: p.sender.map(|x| x.to_lowercase()),
-                newest_first: p.order.unwrap_or_default() == MessageOrder::NewestFirst,
-            };
-            if filter.after.zip(filter.before).is_some_and(|(a, b)| a >= b) {
-                bail!("after must be earlier than before")
-            }
-            let (first, local) = start(&order, p.cursor.as_deref())?;
             let (contacts, readable) = load_contacts(&stores.contacts);
-            let (mut items, mut scanned, mut failures) = (Vec::new(), 0, 0);
-            let (mut next, mut missing) = (None, Vec::new());
-            for (index, source) in order.iter().copied().enumerate().skip(first) {
-                let cursor = if index == first { local.clone() } else { None };
-                if items.len() == cap || scanned == SCAN_LIMIT {
-                    next = Some(format!("{source}:{}", cursor.unwrap_or_default()));
-                    break;
-                }
-                let backend = stores.get(source)?;
-                if !explicit && let Err(error) = backend.check() {
-                    missing.push(Unavailable {
-                        source,
-                        error: format!("{error:#}"),
-                    });
-                    continue;
-                }
-                let (left, budget) = (cap - items.len(), SCAN_LIMIT - scanned);
-                let page = backend.messages(&contacts, &filter, cursor.as_deref(), left, budget)?;
-                items.extend(page.items);
-                scanned += page.scanned;
-                failures += page.decode_failures;
-                if let Some(local) = page.next {
-                    next = Some(format!("{source}:{local}"));
-                    break;
-                }
-            }
-            if missing.len() == order.len() {
-                return Err(none_readable(&missing));
-            }
-            Ok(MessageList {
-                messages: items,
-                complete: next.is_none(),
-                next_cursor: next,
-                scanned_rows: scanned,
-                decode_failures: failures,
-                contacts_databases_read: readable,
-                unavailable_sources: missing,
-            })
+            fetch_messages(stores, p, search, &contacts, readable)
         })
         .await
     }
 }
-const INSTRUCTIONS: &str = "To find messages by person, first call list_conversations with their name; for unread conversations, call list_conversations with unread_only; for recent activity, call list_conversations with active_after, then read_conversation with order newest_first and a small limit";
+
+/// Share the same filters, cursor logic and page shape across single and batch reads.
+fn fetch_messages(
+    stores: &Stores,
+    p: Messages,
+    search: bool,
+    contacts: &Contacts,
+    readable: usize,
+) -> Result<MessageList> {
+    let cap = limit(p.limit)?;
+    if search && p.text.as_deref().is_none_or(|t| t.trim().is_empty()) {
+        bail!("text is required and must not be empty")
+    }
+    if !search && p.conversation_id.is_none() {
+        bail!("conversation_id is required")
+    }
+    let (order, conversation, explicit) = plan(stores, p.source, p.conversation_id.as_deref())?;
+    let filter = Filter {
+        conversation,
+        after: parse_time(p.after.as_deref())?,
+        before: parse_time(p.before.as_deref())?,
+        text: p.text.map(|x| x.to_lowercase()),
+        sender: p.sender.map(|x| x.to_lowercase()),
+        newest_first: p.order.unwrap_or_default() == MessageOrder::NewestFirst,
+    };
+    if filter.after.zip(filter.before).is_some_and(|(a, b)| a >= b) {
+        bail!("after must be earlier than before")
+    }
+    let (first, local) = start(&order, p.cursor.as_deref())?;
+    let (mut items, mut scanned, mut failures) = (Vec::new(), 0, 0);
+    let (mut next, mut missing) = (None, Vec::new());
+    for (index, source) in order.iter().copied().enumerate().skip(first) {
+        let cursor = if index == first { local.clone() } else { None };
+        if items.len() == cap || scanned == SCAN_LIMIT {
+            next = Some(format!("{source}:{}", cursor.unwrap_or_default()));
+            break;
+        }
+        let backend = stores.get(source)?;
+        if !explicit && let Err(error) = backend.check() {
+            missing.push(Unavailable {
+                source,
+                error: format!("{error:#}"),
+            });
+            continue;
+        }
+        let (left, budget) = (cap - items.len(), SCAN_LIMIT - scanned);
+        let page = backend.messages(contacts, &filter, cursor.as_deref(), left, budget)?;
+        items.extend(page.items);
+        scanned += page.scanned;
+        failures += page.decode_failures;
+        if let Some(local) = page.next {
+            next = Some(format!("{source}:{local}"));
+            break;
+        }
+    }
+    if missing.len() == order.len() {
+        return Err(none_readable(&missing));
+    }
+    Ok(MessageList {
+        messages: items,
+        complete: next.is_none(),
+        next_cursor: next,
+        scanned_rows: scanned,
+        decode_failures: failures,
+        contacts_databases_read: readable,
+        unavailable_sources: missing,
+    })
+}
+const INSTRUCTIONS: &str = "To find messages by person, first call list_conversations with their name; for unread conversations, call list_conversations with unread_only; for recent activity, call list_conversations with active_after, then read_conversations for several IDs or read_conversation for one ID. Use order newest_first for recent messages. Reuse an identical read result within one task when no fresh data is needed";
 const SEND_INSTRUCTIONS: &str = " Send messages (iMessage only) only when the user asks. Sending returns submission, not delivery confirmation; never retry automatically.";
 const COMMON_INSTRUCTIONS: &str = " Follow continuation cursors with the same filters. Times use RFC 3339. Phone numbers are E.164 in results and match in any format in arguments. Contact names are optional. To look up a person's numbers and addresses, call search_contacts.";
 

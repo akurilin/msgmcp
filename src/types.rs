@@ -329,6 +329,24 @@ pub struct MessageList {
     pub unavailable_sources: Vec<Unavailable>,
 }
 
+/// One result from read_conversations. A failed conversation does not hide the other pages.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BatchConversationItem {
+    /// The requested source-qualified conversation ID.
+    pub conversation_id: String,
+    /// The first page, or null when this conversation failed. Pass its next_cursor to
+    /// read_conversation with the same conversation_id, limit and order for more messages.
+    pub page: Option<MessageList>,
+    /// Error for this conversation, or null when page is present.
+    pub error: Option<String>,
+}
+
+/// Result of read_conversations, in the same order as the requested IDs.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BatchConversationList {
+    pub results: Vec<BatchConversationItem>,
+}
+
 /// Result of get_message_context.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct MessageContext {

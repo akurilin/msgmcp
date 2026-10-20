@@ -1356,7 +1356,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.client.initialized['capabilities'], {'tools': {}})
         tools = self.client.request('tools/list', {})['tools']
         self.assertEqual({t['name'] for t in tools}, {
-            'list_conversations', 'search_messages', 'read_conversation',
+            'list_conversations', 'search_messages', 'read_conversation', 'read_conversations',
             'get_message_context', 'search_contacts', 'send_message'})
         self.assertTrue(all(t['annotations']['readOnlyHint'] for t in tools if t['name'] != 'send_message'))
         send = next(t for t in tools if t['name'] == 'send_message')
@@ -1374,6 +1374,37 @@ class EndToEnd(unittest.TestCase):
             {'address': '+15551234567', 'name': None, 'ambiguous': False},
             {'address': 'sarah@example.com', 'name': 'Sarah Test', 'ambiguous': False}])
         self.assertEqual(self.client.tool('list_conversations', query='absent')['conversations'], [])
+
+    def test_batch_read_matches_single_pages_and_isolates_errors(self):
+        # One request reads both stores; each page still works with the single-read cursor.
+        ids = ['imessage:1', 'whatsapp:1', 'imessage:999']
+        batch = self.client.tool('read_conversations', conversation_ids=ids, limit=1)
+        self.assertEqual([r['conversation_id'] for r in batch['results']], ids)
+        for item in batch['results'][:2]:
+            expected = self.client.tool('read_conversation',
+                                        conversation_id=item['conversation_id'],
+                                        limit=1, order='newest_first')
+            self.assertEqual(item['page'], expected)
+            self.assertIsNone(item['error'])
+            self.assertIsNotNone(item['page']['next_cursor'])
+            next_page = self.client.tool('read_conversation',
+                                         conversation_id=item['conversation_id'],
+                                         limit=1, order='newest_first',
+                                         cursor=item['page']['next_cursor'])
+            self.assertNotEqual(self.ids(next_page['messages']),
+                                self.ids(item['page']['messages']))
+        self.assertIsNone(batch['results'][2]['page'])
+        self.assertIn('Unknown conversation ID', batch['results'][2]['error'])
+        default = self.client.tool('read_conversations', conversation_ids=['whatsapp:1'])
+        self.assertEqual(self.ids(default['results'][0]['page']['messages']),
+                         self.ids(self.client.tool('read_conversation',
+                                                   conversation_id='whatsapp:1',
+                                                   order='newest_first', limit=10)['messages']))
+        for ids in ([], ['imessage:1'] * 2, ['imessage:1'] * 51):
+            with self.subTest(ids=len(ids)):
+                failed = self.client.request('tools/call', {'name': 'read_conversations',
+                                          'arguments': {'conversation_ids': ids}})
+                self.assertTrue(failed['isError'])
 
     def test_recent_activity_and_newest_first(self):
         # Merged newest first; equal times fall back to source then ID; no messages last.
