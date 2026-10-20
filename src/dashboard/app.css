@@ -186,7 +186,7 @@ section > h2 { margin-bottom: 12px; }
 .badge.error { background: var(--error-soft); color: var(--error); }
 .badge.rejected { background: var(--rejected-soft); color: var(--rejected); }
 .badge.other { background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); }
-.reason { display: block; font-size: 11.5px; color: var(--muted); font-weight: 400; margin-top: 2px; }
+.reason { font-size: 11.5px; color: var(--muted); font-weight: 400; margin-left: 6px; }
 .errtext { display: block; font-size: 11.5px; color: var(--error); margin-top: 2px; }
 
 .filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }

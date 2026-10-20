@@ -162,6 +162,16 @@ pub fn events(now: DateTime<Utc>) -> Vec<Value> {
                     "duration_ms": 3 + rng.below(if tool == "send_message" { 1500 } else { 250 }),
                 })));
             }
+            // An agent's session starts with msgmcp_test, which checks the gateway refuses it.
+            if caller.get("device").is_some() {
+                events.push((
+                    at + 2,
+                    json!({
+                        "transport": "gateway", "event": "rejected", "reason": "missing token",
+                        "status": 401, "probe": true, "caller": caller,
+                    }),
+                ));
+            }
         }
         for _ in 0..1 + rng.below(3) {
             let (reason, caller) = if rng.below(2) == 0 {
@@ -215,7 +225,16 @@ mod tests {
         for kind in ["ok", "error"] {
             assert!(events.iter().any(|e| e["outcome"] == kind));
         }
-        assert!(events.iter().any(|e| e["event"] == "rejected"));
+        assert!(
+            events
+                .iter()
+                .any(|e| e["event"] == "rejected" && e["probe"] == true)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e["event"] == "rejected" && e["probe"].is_null())
+        );
         assert!(events.iter().any(|e| e["tool"] == "send_message"));
         assert!(events.iter().any(|e| e["transport"] == "socket"));
     }

@@ -1005,14 +1005,27 @@ fn event_row(out: &mut String, e: &Ev, now: DateTime<Local>) {
         (Some(tool), _) => tool.clone(),
         (None, event) => event.to_string(),
     };
+    // A refusal the caller asked for, to check the gateway, went as expected, so it is green.
+    // Any caller can claim one, so it still counts as a rejection in the totals and filters.
+    let probe =
+        e.kind == Kind::Rejected && e.raw.get("probe").and_then(Value::as_bool) == Some(true);
     let mut badge = format!(
-        "<span class=\"badge {}\">{}</span>",
-        e.kind.key(),
+        "<span class=\"badge {}\"{}>{}</span>",
+        if probe { "ok" } else { e.kind.key() },
+        if probe {
+            " title=\"The caller marked this request as a check that the gateway refuses it. \
+             Any caller can send that mark.\""
+        } else {
+            ""
+        },
         match e.kind {
-            Kind::Rejected => match e.raw.get("status").filter(|s| !s.is_null()) {
-                Some(status) => format!("rejected {}", esc(&plain(status))),
-                None => "rejected".to_string(),
-            },
+            Kind::Rejected => {
+                let label = if probe { "self-test" } else { "rejected" };
+                match e.raw.get("status").filter(|s| !s.is_null()) {
+                    Some(status) => format!("{label} {}", esc(&plain(status))),
+                    None => label.to_string(),
+                }
+            }
             Kind::Other if e.event == "tool_call" =>
                 esc(str_of(e.raw, "outcome").unwrap_or("other")),
             Kind::Other => "other".to_string(),
@@ -1021,13 +1034,6 @@ fn event_row(out: &mut String, e: &Ev, now: DateTime<Local>) {
     );
     if let Some(reason) = str_of(e.raw, "reason") {
         let _ = write!(badge, "<span class=\"reason\">{}</span>", esc(reason));
-    }
-    // The caller's own word, unverified: a label on the rejection, still counted as one.
-    if e.raw.get("probe").and_then(Value::as_bool) == Some(true) {
-        badge.push_str(
-            "<span class=\"reason\" title=\"The caller marked this request as a check \
-             that the gateway refuses it. Any caller can send that mark.\">self-test</span>",
-        );
     }
     if let Some(error) = e.raw.get("error").filter(|v| !v.is_null()) {
         let _ = write!(
@@ -1519,9 +1525,10 @@ mod tests {
             rejected(3, Some(false)),
         ];
         let html = render(&status(), &events, false, &[], now);
-        assert_eq!(html.matches(">self-test</span>").count(), 1);
+        assert_eq!(html.matches(">self-test 401</span>").count(), 1);
+        assert_eq!(html.matches(">rejected 401</span>").count(), 2);
         assert!(html.contains(
-            "<span class=\"reason\">missing token</span><span class=\"reason\" title=\"The caller marked"
+            "<span class=\"badge ok\" title=\"The caller marked this request as a check"
         ));
         let html = render(
             &status(),
